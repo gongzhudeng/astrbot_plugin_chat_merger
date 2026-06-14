@@ -341,7 +341,11 @@ class ChatMergerPlugin(Star):
         if event.get_extra(MERGED_FLAG_KEY):
             # Route through Path A (handler yields ProviderRequest) to set _has_send_oper.
             # Without this, Path B fallback fires and the merged event gets LLM'd twice.
-            yield event.request_llm(prompt=event.message_str)
+            conv_mgr = self.context.conversation_manager
+            umo = event.unified_msg_origin
+            cid = await conv_mgr.get_curr_conversation_id(umo)
+            conversation = await conv_mgr.get_conversation(umo, cid) if cid else None
+            yield event.request_llm(prompt=event.message_str, conversation=conversation)
             event.stop_event()
             return
 
