@@ -1,0 +1,191 @@
+{
+    "延迟配置": {
+        "description": "延迟发送相关配置",
+        "type": "object",
+        "items": {
+            "min_delay_seconds": {
+                "description": "最短等待时间（秒）",
+                "hint": "用于长消息的最短等待时间，字数越多等待越短",
+                "type": "int",
+                "default": 2
+            },
+            "max_delay_seconds": {
+                "description": "最长等待时间（秒）",
+                "hint": "用于短消息的最长等待时间，字数越少等待越长",
+                "type": "int",
+                "default": 10
+            },
+            "short_msg_threshold": {
+                "description": "短消息字数阈值",
+                "hint": "低于此字数的消息使用最长等待时间",
+                "type": "int",
+                "default": 10
+            },
+            "long_msg_threshold": {
+                "description": "单条长消息字数阈值",
+                "hint": "单条消息超过此字数使用长消息专用等待时间",
+                "type": "int",
+                "default": 50
+            },
+            "long_msg_delay_seconds": {
+                "description": "长消息等待时间（秒）",
+                "hint": "单条消息超过长消息阈值时使用的等待时间",
+                "type": "int",
+                "default": 2
+            },
+            "max_message_count": {
+                "description": "消息条数阈值",
+                "hint": "累积消息达到此条数时直接发送，不再等待",
+                "type": "int",
+                "default": 10
+            }
+        }
+    },
+    "跳过关键词": {
+        "description": "跳过延迟和LLM判断的关键词配置",
+        "type": "object",
+        "items": {
+            "skip_words": {
+                "description": "跳过关键词列表",
+                "hint": "命中后直接发送，跳过所有延迟和LLM判断，可添加多个",
+                "type": "list",
+                "default": ["急", "紧急", "马上", "立刻"]
+            },
+            "skip_words_mode": {
+                "description": "跳过关键词匹配模式",
+                "hint": "包含=消息中包含关键词即命中，完全匹配=消息内容必须和关键词完全一致",
+                "type": "string",
+                "default": "包含",
+                "options": ["包含", "完全匹配"]
+            }
+        }
+    },
+    "超长等待关键词": {
+        "description": "触发超长等待的关键词配置",
+        "type": "object",
+        "items": {
+            "wait_keyword_enabled": {
+                "description": "启用超长等待关键词",
+                "hint": "关闭后超长等待关键词功能失效",
+                "type": "bool",
+                "default": true
+            },
+            "wait_keywords": {
+                "description": "超长等待关键词列表",
+                "hint": "触发后进入超长等待模式，可添加多个",
+                "type": "list",
+                "default": ["等一下", "稍等", "等我一下"]
+            },
+            "wait_keyword_mode": {
+                "description": "超长等待关键词匹配模式",
+                "hint": "包含=消息中包含关键词即触发，完全匹配=消息内容必须和关键词完全一致",
+                "type": "string",
+                "default": "完全匹配",
+                "options": ["包含", "完全匹配"]
+            },
+            "wait_keyword_seconds": {
+                "description": "超长等待时间（秒）",
+                "hint": "触发后的等待时间，设为0表示无限等待",
+                "type": "int",
+                "default": 300
+            },
+            "wait_keyword_random_range": {
+                "description": "等待时间随机变化范围（秒）",
+                "hint": "实际等待时间会在设定值±此范围内随机波动，设为0则不随机。例如设定300秒，范围30，则实际等待270~330秒",
+                "type": "int",
+                "default": 0
+            },
+            "image_wait_enabled": {
+                "description": "图片触发超长等待",
+                "hint": "开启后，单独发送图片（不带文字）会自动触发超长等待，等同于触发等待关键词",
+                "type": "bool",
+                "default": true
+            }
+        }
+    },
+    "LLM智能判断": {
+        "description": "使用LLM模型智能判断等待时间（可选功能）",
+        "type": "object",
+        "items": {
+            "llm_judge_enabled": {
+                "description": "启用LLM智能判断",
+                "hint": "开启后会调用LLM判断应该等待多久，效果不好可关闭",
+                "type": "bool",
+                "default": false
+            },
+            "llm_provider_id": {
+                "description": "LLM模型提供商",
+                "hint": "选择用于判断延迟时间的LLM模型，留空则使用系统默认模型",
+                "type": "string",
+                "default": "",
+                "_special": "select_provider"
+            },
+            "llm_judge_prompt": {
+                "description": "LLM判断提示词模板",
+                "hint": "可用变量：{messages}=当前消息 {word_count}=总字数 {msg_count}=消息条数",
+                "type": "text",
+                "default": "你是一个消息合并助手。当前已累积消息：\n{messages}\n总字数：{word_count}，消息条数：{msg_count}\n请判断用户是否已经说完，应该等待多久再发送给AI。\n回复格式（只回复数字）：\n- 0：立即发送\n- 正整数：等待的秒数\n只回复数字，不要解释。"
+            }
+        }
+    },
+    "AI忙感知": {
+        "description": "AI忙碌时自动等待，等AI处理完上一条消息后再发送合并消息",
+        "type": "object",
+        "items": {
+            "ai_busy_wait_enabled": {
+                "description": "启用AI忙感知",
+                "hint": "开启后，当AI正在处理上一条消息时，合并消息会等待AI处理完成后再发送，避免消息堆积",
+                "type": "bool",
+                "default": true
+            },
+            "ai_busy_check_interval": {
+                "description": "检查AI是否空闲的间隔（秒）",
+                "hint": "AI忙碌时每隔多久检查一次是否空闲",
+                "type": "int",
+                "default": 3
+            },
+            "ai_busy_max_wait": {
+                "description": "AI忙最大等待时间（秒）",
+                "hint": "超过此时间AI仍未空闲则强制发送，防止无限等待",
+                "type": "int",
+                "default": 120
+            }
+        }
+    },
+    "输入状态显示": {
+        "description": "AI思考时显示\"正在输入...\"状态（仅私聊，需NapCat/aiocqhttp平台）",
+        "type": "object",
+        "items": {
+            "typing_status_enabled": {
+                "description": "启用输入状态显示",
+                "hint": "开启后，AI思考时会在QQ等平台显示\"对方正在输入...\"状态",
+                "type": "bool",
+                "default": true
+            },
+            "typing_interval": {
+                "description": "输入状态刷新间隔（秒）",
+                "hint": "每隔多久刷新一次输入状态，建议0.3~1秒",
+                "type": "float",
+                "default": 0.5
+            }
+        }
+    },
+    "其他配置": {
+        "description": "其他杂项配置",
+        "type": "object",
+        "items": {
+            "enabled": {
+                "description": "启用插件",
+                "hint": "关闭后插件完全停止工作",
+                "type": "bool",
+                "default": true
+            },
+            "debug_mode": {
+                "description": "调试模式",
+                "hint": "开启后在系统日志中显示详细的合并过程信息",
+                "type": "bool",
+                "default": false
+            }
+        }
+    }
+}
