@@ -345,7 +345,18 @@ class ChatMergerPlugin(Star):
             umo = event.unified_msg_origin
             cid = await conv_mgr.get_curr_conversation_id(umo)
             conversation = await conv_mgr.get_conversation(umo, cid) if cid else None
-            yield event.request_llm(prompt=event.message_str, conversation=conversation)
+            image_urls = []
+            for comp in event.message_obj.message:
+                if isinstance(comp, Image):
+                    try:
+                        image_urls.append(await comp.convert_to_file_path())
+                    except Exception:
+                        pass
+            yield event.request_llm(
+                prompt=event.message_str,
+                conversation=conversation,
+                image_urls=image_urls or None,
+            )
             event.stop_event()
             return
 
