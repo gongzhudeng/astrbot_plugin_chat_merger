@@ -3,6 +3,6 @@ display_name: 灵犀 · 消息合并助手
 desc: >
   让AI聊天告别一问一答！自动合并连续消息 + "正在输入"状态，打造真人级对话体验。
   支持智能延迟计算、跳过关键词、超长等待、AI忙感知排队、图片触发等待等功能。
-version: 2.0.0
+version: 2.0.1
 author: 灵犀
 repo: https://github.com/gongzhudeng/astrbot_plugin_chat_merger

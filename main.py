@@ -342,7 +342,10 @@ class ChatMergerPlugin(Star):
             return
 
         # ── Typing-state notification (NapCat input_status) ──────────────
-        if self._get_config("enable_typing_detection", False) and self._is_typing_event(event):
+        if self._is_typing_event(event):
+            if not self._get_config("enable_typing_detection", False):
+                event.stop_event()
+                return
             raw = event.message_obj.raw_message
             user_id = event.get_sender_id()
             is_typing = "正在输入" in raw.get("status_text", "")
