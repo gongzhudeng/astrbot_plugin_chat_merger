@@ -10,6 +10,12 @@ from astrbot.api.event.filter import EventMessageType
 from astrbot.api.star import Context, Star, register
 from astrbot.core.message.components import Image, Plain
 
+try:
+    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+    IS_AIOCQHTTP = True
+except ImportError:
+    IS_AIOCQHTTP = False
+
 
 def count_words(text: str) -> int:
     """Count Chinese characters and English words."""
@@ -24,8 +30,8 @@ MERGED_FLAG_KEY = "chat_merger_merged"
 @register(
     "astrbot_plugin_chat_merger",
     "灵犀 · 消息合并助手",
-    "彻底告别一问一答式AI聊天。自动合并连续消息、智能延迟后统一回复，AI思考时显示\"对方正在输入…\"。支持关键词触发超长等待、图片智能合并、等待时间随机波动、AI忙感知自动排队、LLM智能延迟判断，让AI对话真正拥有真人聊天的节奏感",
-    "1.3.0",
+    "彻底告别一问一答式AI聊天。自动合并连续消息、智能延迟后统一回复，AI思考时显示\"对方正在输入…\"。支持关键词触发超长等待、图片智能合并、等待时间随机波动、AI忙感知自动排队、LLM智能延迟判断、输入状态感知、撤回消息过滤，让AI对话真正拥有真人聊天的节奏感",
+    "2.0.0",
     "https://github.com/gongzhudeng/astrbot_plugin_chat_merger",
 )
 class ChatMergerPlugin(Star):
@@ -42,6 +48,12 @@ class ChatMergerPlugin(Star):
         self._typing_tasks: dict[str, asyncio.Task] = {}
         self._typing_stop_events: dict[str, asyncio.Event] = {}
         self._extra_components: dict[str, list] = defaultdict(list)
+        # typing detection state
+        self._is_typing: dict[str, bool] = {}
+        self._timer_end_time: dict[str, float] = {}
+        self._typing_paused_deadline: dict[str, float] = {}
+        # recall filter: per-user ordered list of {message_id, text}
+        self._message_items: dict[str, list[dict]] = defaultdict(list)
         self._debug("插件已初始化")
 
     # ── Utility ──────────────────────────────────────────────
@@ -146,6 +158,49 @@ class ChatMergerPlugin(Star):
         if task and not task.done():
             task.cancel()
 
+    # ── User typing-state detection (NapCat input_status) ────
+
+    @staticmethod
+    def _is_typing_event(event: AstrMessageEvent) -> bool:
+        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+            return False
+        try:
+            raw = getattr(event.message_obj, "raw_message", None)
+            return (
+                isinstance(raw, dict)
+                and raw.get("post_type") == "notice"
+                and raw.get("sub_type") == "input_status"
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_recall_event(event: AstrMessageEvent) -> bool:
+        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+            return False
+        try:
+            raw = getattr(event.message_obj, "raw_message", None)
+            return (
+                isinstance(raw, dict)
+                and raw.get("post_type") == "notice"
+                and raw.get("notice_type") in ("friend_recall", "group_recall")
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _get_message_id(event: AstrMessageEvent):
+        try:
+            mid = getattr(event.message_obj, "message_id", None)
+            if mid is not None:
+                return mid
+            raw = getattr(event.message_obj, "raw_message", None)
+            if isinstance(raw, dict):
+                return raw.get("message_id")
+        except Exception:
+            pass
+        return None
+
     # ── Keyword checks ───────────────────────────────────────
 
     def _check_skip_words(self, text: str) -> bool:
@@ -197,44 +252,6 @@ class ChatMergerPlugin(Star):
         total_text = "\n".join(messages)
         return self._calc_delay_for_text(total_text)
 
-    # ── LLM judge (optional) ────────────────────────────────
-
-    async def _get_llm_delay(self, user_id: str) -> float:
-        if not self._get_config("llm_judge_enabled", False):
-            return -1
-        messages = self.message_queues[user_id]
-        if not messages:
-            return -1
-        total_text = "\n".join(messages)
-        word_count = count_words(total_text)
-        prompt_template = self._get_config("llm_judge_prompt", "")
-        if not prompt_template:
-            return -1
-        prompt = prompt_template.format(
-            messages=total_text,
-            word_count=word_count,
-            msg_count=len(messages),
-        )
-        try:
-            provider_id = self._get_config("llm_provider_id", "")
-            provider = None
-            if provider_id:
-                provider = self.context.get_provider_by_id(provider_id)
-            if not provider:
-                provider = self.context.get_using_provider()
-            if not provider:
-                return -1
-            resp = await provider.text_chat(
-                prompt=prompt,
-                session_id=f"merger_{user_id}",
-            )
-            nums = re.findall(r"-?\d+", resp.completion_text.strip())
-            if nums:
-                return max(0, min(int(nums[0]), 300))
-        except Exception as e:
-            self._log(f"LLM判断出错: {e}")
-        return -1
-
     # ── Timer management ─────────────────────────────────────
 
     def _cancel_timer(self, user_id: str) -> None:
@@ -247,6 +264,7 @@ class ChatMergerPlugin(Star):
         if delay <= 0:
             asyncio.create_task(self._send_merged(user_id))
             return
+        self._timer_end_time[user_id] = time.time() + delay
         task = asyncio.create_task(self._timer_callback(user_id, delay))
         self.timers[user_id] = task
 
@@ -303,10 +321,13 @@ class ChatMergerPlugin(Star):
         event.set_extra(MERGED_FLAG_KEY, True)
 
         self.message_queues[user_id] = []
+        self._message_items[user_id] = []
         self._event_refs.pop(user_id, None)
         self._extra_components.pop(user_id, None)
         self.infinite_wait[user_id] = False
         self.wait_start_time.pop(user_id, None)
+        self._is_typing.pop(user_id, None)
+        self._timer_end_time.pop(user_id, None)
 
         try:
             self.context.get_event_queue().put_nowait(event)
@@ -320,9 +341,66 @@ class ChatMergerPlugin(Star):
         if not self._get_config("enabled", True):
             return
 
-        # 检查原始消息文本（含 / 前缀），跳过所有斜杠命令
+        # ── Typing-state notification (NapCat input_status) ──────────────
+        if self._get_config("enable_typing_detection", False) and self._is_typing_event(event):
+            raw = event.message_obj.raw_message
+            user_id = event.get_sender_id()
+            is_typing = "正在输入" in raw.get("status_text", "")
+            has_active_queue = bool(self.message_queues.get(user_id))
+            if has_active_queue:
+                if is_typing and not self._is_typing.get(user_id):
+                    self._is_typing[user_id] = True
+                    # Save remaining time before cancelling
+                    saved = max(0.5, self._timer_end_time.get(user_id, time.time()) - time.time())
+                    self._typing_paused_deadline[user_id] = saved
+                    self._cancel_timer(user_id)
+                    # Timeout-protection timer so we don't wait forever
+                    max_wait = float(self._get_config("max_typing_wait", 60.0))
+                    task = asyncio.create_task(self._timer_callback(user_id, max_wait))
+                    self.timers[user_id] = task
+                    self._debug(f"[{user_id}] 用户正在输入，暂停倒计时（超时保护 {max_wait}s）")
+                elif not is_typing and self._is_typing.get(user_id):
+                    self._is_typing[user_id] = False
+                    self._cancel_timer(user_id)
+                    remaining = self._typing_paused_deadline.pop(user_id, self._get_config("min_delay_seconds", 2))
+                    self._timer_end_time[user_id] = time.time() + remaining
+                    task = asyncio.create_task(self._timer_callback(user_id, remaining))
+                    self.timers[user_id] = task
+                    self._debug(f"[{user_id}] 用户停止输入，恢复倒计时 {remaining:.1f}s")
+            event.stop_event()
+            return
+
+        # ── Recall-message filter ─────────────────────────────────────────
+        if self._get_config("enable_recall_filter", True) and self._is_recall_event(event):
+            try:
+                raw = event.message_obj.raw_message
+                recalled_mid = raw.get("message_id") if isinstance(raw, dict) else None
+            except Exception:
+                recalled_mid = None
+            user_id = event.get_sender_id()
+            if recalled_mid is not None and user_id in self._message_items:
+                before = len(self._message_items[user_id])
+                self._message_items[user_id] = [
+                    it for it in self._message_items[user_id]
+                    if str(it["message_id"]) != str(recalled_mid)
+                ]
+                if len(self._message_items[user_id]) < before:
+                    self.message_queues[user_id] = [
+                        it["text"] for it in self._message_items[user_id] if it["text"]
+                    ]
+                    self._log(f"[{user_id}] 撤回消息已移除 | mid={recalled_mid} | 剩余 {len(self._message_items[user_id])} 条")
+                    if not self._message_items[user_id]:
+                        self._cancel_timer(user_id)
+                        self.message_queues[user_id] = []
+                        self._event_refs.pop(user_id, None)
+                        self._message_items[user_id] = []
+            event.stop_event()
+            return
+
+        # ── Skip messages that start with a command prefix ────────────────
         original_text = self._get_original_text(event)
-        if original_text.startswith("/"):
+        command_prefixes = self._get_config("command_prefixes", ["/"])
+        if any(original_text.startswith(p) for p in command_prefixes):
             return
 
         user_id = event.get_sender_id()
@@ -366,6 +444,7 @@ class ChatMergerPlugin(Star):
         if text and self._check_skip_words(text):
             event.stop_event()
             self.message_queues[user_id].append(text)
+            self._message_items[user_id].append({"message_id": self._get_message_id(event), "text": text})
             self._event_refs[user_id] = event
             self._extra_components[user_id].extend(self._extract_extra_components(event))
             self._log(
@@ -380,7 +459,9 @@ class ChatMergerPlugin(Star):
         if is_wait:
             event.stop_event()
             display_text = text if text else "[图片]"
-            self.message_queues[user_id].append(text if text else "[图片]")
+            queued_text = text if text else "[图片]"
+            self.message_queues[user_id].append(queued_text)
+            self._message_items[user_id].append({"message_id": self._get_message_id(event), "text": queued_text})
             self._event_refs[user_id] = event
             self._extra_components[user_id].extend(self._extract_extra_components(event))
             wait_sec = self._get_config("wait_keyword_seconds", 300)
@@ -406,6 +487,7 @@ class ChatMergerPlugin(Star):
         # Normal message: stop event, queue it
         event.stop_event()
         self.message_queues[user_id].append(text)
+        self._message_items[user_id].append({"message_id": self._get_message_id(event), "text": text})
         self._event_refs[user_id] = event
         self._extra_components[user_id].extend(self._extract_extra_components(event))
         if user_id not in self.wait_start_time:
@@ -424,19 +506,11 @@ class ChatMergerPlugin(Star):
             return
 
         # Determine delay
-        llm_delay = await self._get_llm_delay(user_id)
-        if llm_delay >= 0:
-            delay = llm_delay
-            self._log(
-                f"[{user_id}] 收到消息: \"{text[:30]}\" | 队列: {new_queue_len}条 | LLM判断等待: {delay}秒"
-            )
-            self._start_timer(user_id, event, delay)
-        else:
-            delay = self._calc_queue_delay(user_id)
-            self._log(
-                f"[{user_id}] 收到消息: \"{text[:30]}\" | 队列: {new_queue_len}条 | 等待: {delay:.0f}秒后发送"
-            )
-            self._start_timer(user_id, event, delay)
+        delay = self._calc_queue_delay(user_id)
+        self._log(
+            f"[{user_id}] 收到消息: \"{text[:30]}\" | 队列: {new_queue_len}条 | 等待: {delay:.0f}秒后发送"
+        )
+        self._start_timer(user_id, event, delay)
 
     # ── Plugin commands ───────────────────────────────────────
 
@@ -534,12 +608,16 @@ class ChatMergerPlugin(Star):
         for uid in list(self._typing_tasks.keys()):
             self._stop_typing(uid)
         self.message_queues.clear()
+        self._message_items.clear()
         self._event_refs.clear()
         self.infinite_wait.clear()
         self.wait_start_time.clear()
         self._ai_busy.clear()
         self._ai_busy_wait_tasks.clear()
         self._extra_components.clear()
+        self._is_typing.clear()
+        self._timer_end_time.clear()
+        self._typing_paused_deadline.clear()
         self._log("插件已卸载")
 
     # ── AI busy hooks ───────────────────────────────────────

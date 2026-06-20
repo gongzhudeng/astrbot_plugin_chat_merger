@@ -103,31 +103,6 @@
             }
         }
     },
-    "LLM智能判断": {
-        "description": "使用LLM模型智能判断等待时间（可选功能）",
-        "type": "object",
-        "items": {
-            "llm_judge_enabled": {
-                "description": "启用LLM智能判断",
-                "hint": "开启后会调用LLM判断应该等待多久，效果不好可关闭",
-                "type": "bool",
-                "default": false
-            },
-            "llm_provider_id": {
-                "description": "LLM模型提供商",
-                "hint": "选择用于判断延迟时间的LLM模型，留空则使用系统默认模型",
-                "type": "string",
-                "default": "",
-                "_special": "select_provider"
-            },
-            "llm_judge_prompt": {
-                "description": "LLM判断提示词模板",
-                "hint": "可用变量：{messages}=当前消息 {word_count}=总字数 {msg_count}=消息条数",
-                "type": "text",
-                "default": "你是一个消息合并助手。当前已累积消息：\n{messages}\n总字数：{word_count}，消息条数：{msg_count}\n请判断用户是否已经说完，应该等待多久再发送给AI。\n回复格式（只回复数字）：\n- 0：立即发送\n- 正整数：等待的秒数\n只回复数字，不要解释。"
-            }
-        }
-    },
     "AI忙感知": {
         "description": "AI忙碌时自动等待，等AI处理完上一条消息后再发送合并消息",
         "type": "object",
@@ -170,6 +145,24 @@
             }
         }
     },
+    "输入状态感知": {
+        "description": "感知用户正在输入，自动暂停倒计时（仅 NapCat/aiocqhttp 平台有效；QQ 需在「设置→隐私→输入设置」中开启「我的输入状态可见」，否则本功能无效）",
+        "type": "object",
+        "items": {
+            "enable_typing_detection": {
+                "description": "启用输入状态感知",
+                "hint": "检测到用户正在输入时暂停倒计时，停止输入后再继续剩余倒计时（仅 NapCat 等支持 input_status 的 aiocqhttp 平台有效；QQ 需开启「输入设置 → 我的输入状态可见」）",
+                "type": "bool",
+                "default": false
+            },
+            "max_typing_wait": {
+                "description": "输入状态超时保护（秒）",
+                "hint": "用户正在输入时最长暂停多久。超时后自动恢复倒计时，防止平台未发送停止输入事件导致卡死",
+                "type": "float",
+                "default": 60
+            }
+        }
+    },
     "其他配置": {
         "description": "其他杂项配置",
         "type": "object",
@@ -177,6 +170,18 @@
             "enabled": {
                 "description": "启用插件",
                 "hint": "关闭后插件完全停止工作",
+                "type": "bool",
+                "default": true
+            },
+            "command_prefixes": {
+                "description": "指令前缀列表",
+                "hint": "以这些前缀开头的消息会被直接识别为指令，不会被合并，默认为 [\"/\"]",
+                "type": "list",
+                "default": ["/"]
+            },
+            "enable_recall_filter": {
+                "description": "启用撤回消息过滤",
+                "hint": "在等待期间若用户撤回了某条消息，会将其从待发送队列中移除（仅 aiocqhttp/OneBot v11 平台有效）",
                 "type": "bool",
                 "default": true
             },
