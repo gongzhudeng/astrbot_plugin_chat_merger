@@ -51,7 +51,7 @@ class ChatMergerPlugin(Star):
         # typing detection state
         self._is_typing: dict[str, bool] = {}
         self._timer_end_time: dict[str, float] = {}
-        self._typing_paused_deadline: dict[str, float] = {}
+        self._calc_delay: dict[str, float] = {}
         # recall filter: per-user ordered list of {message_id, text}
         self._message_items: dict[str, list[dict]] = defaultdict(list)
         self._debug("插件已初始化")
@@ -264,6 +264,7 @@ class ChatMergerPlugin(Star):
         if delay <= 0:
             asyncio.create_task(self._send_merged(user_id))
             return
+        self._calc_delay[user_id] = delay
         self._timer_end_time[user_id] = time.time() + delay
         task = asyncio.create_task(self._timer_callback(user_id, delay))
         self.timers[user_id] = task
@@ -328,6 +329,7 @@ class ChatMergerPlugin(Star):
         self.wait_start_time.pop(user_id, None)
         self._is_typing.pop(user_id, None)
         self._timer_end_time.pop(user_id, None)
+        self._calc_delay.pop(user_id, None)
 
         try:
             self.context.get_event_queue().put_nowait(event)
@@ -351,25 +353,24 @@ class ChatMergerPlugin(Star):
             is_typing = "正在输入" in raw.get("status_text", "")
             has_active_queue = bool(self.message_queues.get(user_id))
             if has_active_queue:
-                if is_typing and not self._is_typing.get(user_id):
+                if is_typing:
                     self._is_typing[user_id] = True
-                    # Save remaining time before cancelling
-                    saved = max(0.5, self._timer_end_time.get(user_id, time.time()) - time.time())
-                    self._typing_paused_deadline[user_id] = saved
                     self._cancel_timer(user_id)
-                    # Timeout-protection timer so we don't wait forever
+                    # Reset with timeout-protection timer
                     max_wait = float(self._get_config("max_typing_wait", 60.0))
+                    self._timer_end_time[user_id] = time.time() + max_wait
                     task = asyncio.create_task(self._timer_callback(user_id, max_wait))
                     self.timers[user_id] = task
-                    self._debug(f"[{user_id}] 用户正在输入，暂停倒计时（超时保护 {max_wait}s）")
-                elif not is_typing and self._is_typing.get(user_id):
+                    self._debug(f"[{user_id}] 用户正在输入，重置倒计时（超时保护 {max_wait}s）")
+                elif self._is_typing.get(user_id):
                     self._is_typing[user_id] = False
                     self._cancel_timer(user_id)
-                    remaining = self._typing_paused_deadline.pop(user_id, self._get_config("min_delay_seconds", 2))
-                    self._timer_end_time[user_id] = time.time() + remaining
-                    task = asyncio.create_task(self._timer_callback(user_id, remaining))
+                    # Reset with original full delay
+                    delay = self._calc_delay.get(user_id, self._get_config("min_delay_seconds", 2))
+                    self._timer_end_time[user_id] = time.time() + delay
+                    task = asyncio.create_task(self._timer_callback(user_id, delay))
                     self.timers[user_id] = task
-                    self._debug(f"[{user_id}] 用户停止输入，恢复倒计时 {remaining:.1f}s")
+                    self._debug(f"[{user_id}] 用户停止输入，重置倒计时 {delay:.1f}s")
             event.stop_event()
             return
 
@@ -620,7 +621,7 @@ class ChatMergerPlugin(Star):
         self._extra_components.clear()
         self._is_typing.clear()
         self._timer_end_time.clear()
-        self._typing_paused_deadline.clear()
+        self._calc_delay.clear()
         self._log("插件已卸载")
 
     # ── AI busy hooks ───────────────────────────────────────
