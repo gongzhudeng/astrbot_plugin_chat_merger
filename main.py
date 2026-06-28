@@ -365,8 +365,8 @@ class ChatMergerPlugin(Star):
                 elif self._is_typing.get(user_id):
                     self._is_typing[user_id] = False
                     self._cancel_timer(user_id)
-                    # Reset with original full delay
-                    delay = self._calc_delay.get(user_id, self._get_config("min_delay_seconds", 2))
+                    # Recalculate delay from current queue to avoid inheriting wait_keyword delay
+                    delay = self._calc_queue_delay(user_id) or self._get_config("min_delay_seconds", 2)
                     self._timer_end_time[user_id] = time.time() + delay
                     task = asyncio.create_task(self._timer_callback(user_id, delay))
                     self.timers[user_id] = task
