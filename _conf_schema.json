@@ -57,6 +57,24 @@
                 "type": "string",
                 "default": "包含",
                 "options": ["包含", "完全匹配"]
+            },
+            "skip_words_random_delay_enabled": {
+                "description": "启用跳过词随机等待",
+                "hint": "命中跳过词后不立即发送，而是等待一个随机时间后再发送",
+                "type": "bool",
+                "default": false
+            },
+            "skip_words_random_delay_min": {
+                "description": "随机等待最短时间（秒）",
+                "hint": "命中跳过词后随机等待的下限，启用随机等待后生效",
+                "type": "float",
+                "default": 0.5
+            },
+            "skip_words_random_delay_max": {
+                "description": "随机等待最长时间（秒）",
+                "hint": "命中跳过词后随机等待的上限，启用随机等待后生效",
+                "type": "float",
+                "default": 3.0
             }
         }
     },

@@ -31,7 +31,7 @@ MERGED_FLAG_KEY = "chat_merger_merged"
     "astrbot_plugin_chat_merger",
     "灵犀 · 消息合并助手",
     "彻底告别一问一答式AI聊天。自动合并连续消息、智能延迟后统一回复，AI思考时显示\"对方正在输入…\"。支持关键词触发超长等待、图片智能合并、等待时间随机波动、AI忙感知自动排队、LLM智能延迟判断、输入状态感知、撤回消息过滤，让AI对话真正拥有真人聊天的节奏感",
-    "2.0.0",
+    "2.0.4",
     "https://github.com/gongzhudeng/astrbot_plugin_chat_merger",
 )
 class ChatMergerPlugin(Star):
@@ -444,18 +444,28 @@ class ChatMergerPlugin(Star):
 
         queue_len = len(self.message_queues[user_id])
 
-        # Skip keyword (text only): flush entire queue + skip keyword immediately
+        # Skip keyword (text only): flush entire queue + skip keyword immediately (or after random delay)
         if text and self._check_skip_words(text):
             event.stop_event()
             self.message_queues[user_id].append(text)
             self._message_items[user_id].append({"message_id": self._get_message_id(event), "text": text})
             self._event_refs[user_id] = event
             self._extra_components[user_id].extend(self._extract_extra_components(event))
-            self._log(
-                f"[{user_id}] 命中跳过词: \"{text[:30]}\" | 队列: {len(self.message_queues[user_id])}条, 立即发送"
-            )
             self._cancel_timer(user_id)
-            await self._send_merged(user_id)
+            if self._get_config("skip_words_random_delay_enabled", False):
+                delay_min = float(self._get_config("skip_words_random_delay_min", 0.5))
+                delay_max = float(self._get_config("skip_words_random_delay_max", 3.0))
+                delay_min, delay_max = min(delay_min, delay_max), max(delay_min, delay_max)
+                rand_delay = random.uniform(delay_min, delay_max)
+                self._log(
+                    f"[{user_id}] 命中跳过词: \"{text[:30]}\" | 队列: {len(self.message_queues[user_id])}条, 随机等待 {rand_delay:.2f}s 后发送"
+                )
+                self._start_timer(user_id, event, rand_delay)
+            else:
+                self._log(
+                    f"[{user_id}] 命中跳过词: \"{text[:30]}\" | 队列: {len(self.message_queues[user_id])}条, 立即发送"
+                )
+                await self._send_merged(user_id)
             return
 
         # Wait keyword or image-only
