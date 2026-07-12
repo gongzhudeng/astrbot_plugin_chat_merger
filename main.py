@@ -636,6 +636,15 @@ class ChatMergerPlugin(Star):
 
     # ── AI busy hooks ───────────────────────────────────────
 
+    def _mark_ai_idle(self, user_id: str, source: str) -> None:
+        """Clear busy and typing state after AI processing finishes."""
+        was_busy = self._ai_busy.get(user_id, False)
+        had_typing_task = user_id in self._typing_tasks
+        self._ai_busy[user_id] = False
+        self._stop_typing(user_id)
+        if was_busy or had_typing_task:
+            self._debug(f"[{user_id}] AI处理完成 ({source})")
+
     @filter.on_llm_request()
     async def _on_llm_request(self, event: AstrMessageEvent, req) -> None:
         user_id = event.get_sender_id()
@@ -646,10 +655,18 @@ class ChatMergerPlugin(Star):
 
     @filter.on_llm_response()
     async def _on_llm_response(self, event: AstrMessageEvent, resp) -> None:
-        user_id = event.get_sender_id()
-        self._ai_busy[user_id] = False
-        self._stop_typing(user_id)
-        self._debug(f"[{user_id}] AI处理完成")
+        self._mark_ai_idle(event.get_sender_id(), "LLM响应")
+
+    @filter.on_agent_done()
+    async def _on_agent_done(self, event: AstrMessageEvent, *args) -> None:
+        self._mark_ai_idle(event.get_sender_id(), "Agent结束")
+
+    @filter.on_llm_tool_respond()
+    async def _on_llm_tool_respond(
+        self, event: AstrMessageEvent, tool, tool_args, tool_result
+    ) -> None:
+        if tool_result is None:
+            self._mark_ai_idle(event.get_sender_id(), "工具直发结束")
 
     async def _wait_ai_free(self, user_id: str) -> None:
         """Wait until AI is free, then send merged message."""
