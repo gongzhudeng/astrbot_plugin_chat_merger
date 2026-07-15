@@ -1,4 +1,5 @@
 import asyncio
+import html
 import random
 import re
 import time
@@ -8,10 +9,17 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import EventMessageType
 from astrbot.api.star import Context, Star, register
-from astrbot.core.message.components import Image, Plain
+from astrbot.core.message.components import Image, Plain, Reply
+from astrbot.core.utils.quoted_message_parser import (
+    extract_quoted_message_images,
+    extract_quoted_message_text,
+)
 
 try:
-    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+        AiocqhttpMessageEvent,
+    )
+
     IS_AIOCQHTTP = True
 except ImportError:
     IS_AIOCQHTTP = False
@@ -30,7 +38,7 @@ MERGED_FLAG_KEY = "chat_merger_merged"
 @register(
     "astrbot_plugin_chat_merger",
     "灵犀 · 消息合并助手",
-    "彻底告别一问一答式AI聊天。自动合并连续消息、智能延迟后统一回复，AI思考时显示\"对方正在输入…\"。支持关键词触发超长等待、图片智能合并、等待时间随机波动、AI忙感知自动排队、LLM智能延迟判断、输入状态感知、撤回消息过滤，让AI对话真正拥有真人聊天的节奏感",
+    '彻底告别一问一答式AI聊天。自动合并连续消息、智能延迟后统一回复，AI思考时显示"对方正在输入…"。支持关键词触发超长等待、图片智能合并、等待时间随机波动、AI忙感知自动排队、LLM智能延迟判断、输入状态感知、撤回消息过滤，让AI对话真正拥有真人聊天的节奏感',
     "2.0.4",
     "https://github.com/gongzhudeng/astrbot_plugin_chat_merger",
 )
@@ -38,7 +46,7 @@ class ChatMergerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self.message_queues: dict[str, list[str]] = defaultdict(list)
+        self.message_queues: dict[str, list[dict]] = defaultdict(list)
         self.timers: dict[str, asyncio.Task] = {}
         self._event_refs: dict[str, AstrMessageEvent] = {}
         self.infinite_wait: dict[str, bool] = defaultdict(bool)
@@ -47,13 +55,10 @@ class ChatMergerPlugin(Star):
         self._ai_busy_wait_tasks: dict[str, asyncio.Task] = {}
         self._typing_tasks: dict[str, asyncio.Task] = {}
         self._typing_stop_events: dict[str, asyncio.Event] = {}
-        self._extra_components: dict[str, list] = defaultdict(list)
         # typing detection state
         self._is_typing: dict[str, bool] = {}
         self._timer_end_time: dict[str, float] = {}
         self._calc_delay: dict[str, float] = {}
-        # recall filter: per-user ordered list of {message_id, text}
-        self._message_items: dict[str, list[dict]] = defaultdict(list)
         self._debug("插件已初始化")
 
     # ── Utility ──────────────────────────────────────────────
@@ -103,9 +108,97 @@ class ChatMergerPlugin(Star):
         return has_image and not has_text
 
     @staticmethod
-    def _extract_extra_components(event: AstrMessageEvent) -> list:
-        """Extract non-Plain message components (Image, etc.) for preservation."""
-        return [comp for comp in event.message_obj.message if not isinstance(comp, Plain)]
+    def _extract_preserved_components(event: AstrMessageEvent) -> list:
+        """Preserve current-message attachments without replaying quote metadata."""
+        return [
+            comp
+            for comp in event.message_obj.message
+            if not isinstance(comp, (Plain, Reply))
+        ]
+
+    @staticmethod
+    def _format_quoted_message(
+        event: AstrMessageEvent,
+        reply: Reply,
+        text: str,
+        image_count: int,
+    ) -> str:
+        sender = reply.sender_nickname or (
+            f"user_id:{reply.sender_id}" if reply.sender_id else "未知发送者"
+        )
+        role = (
+            "assistant"
+            if reply.sender_id and str(reply.sender_id) == str(event.get_self_id())
+            else "user"
+        )
+        content_parts = []
+        if text and text != "[Empty Text]":
+            content_parts.append(text)
+        if image_count:
+            content_parts.append(f"[引用图片: {image_count}张]")
+        if not content_parts:
+            content_parts.append("[空引用消息]")
+        content = "\n".join(content_parts)
+        return (
+            f'<quoted_message sender="{html.escape(str(sender), quote=True)}" '
+            f'role="{role}">'
+            f"{html.escape(content)}"
+            "</quoted_message>"
+        )
+
+    async def _build_queue_item(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        *,
+        image_only: bool = False,
+    ) -> dict:
+        text_parts = []
+        quote_images = []
+        for comp in event.message_obj.message:
+            if not isinstance(comp, Reply):
+                continue
+            try:
+                quoted_text = await extract_quoted_message_text(event, comp) or ""
+                quoted_images = await extract_quoted_message_images(event, comp)
+            except Exception as e:
+                self._log(f"引用消息解析失败 | reply_id={comp.id} | {e}")
+                quoted_text = comp.message_str or ""
+                quoted_images = []
+            text_parts.append(
+                self._format_quoted_message(
+                    event,
+                    comp,
+                    quoted_text,
+                    len(quoted_images),
+                )
+            )
+            quote_images.extend(Image(file=image_ref) for image_ref in quoted_images)
+
+        if text:
+            text_parts.append(text)
+        elif image_only:
+            text_parts.append("[图片]")
+
+        return {
+            "message_id": self._get_message_id(event),
+            "text": "\n".join(text_parts).strip(),
+            "components": quote_images + self._extract_preserved_components(event),
+            "event": event,
+        }
+
+    async def _enqueue_message(
+        self,
+        user_id: str,
+        event: AstrMessageEvent,
+        text: str,
+        *,
+        image_only: bool = False,
+    ) -> dict:
+        item = await self._build_queue_item(event, text, image_only=image_only)
+        self.message_queues[user_id].append(item)
+        self._event_refs[user_id] = event
+        return item
 
     # ── Typing state (NapCat input status) ───────────────────
 
@@ -115,6 +208,7 @@ class ChatMergerPlugin(Star):
             from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
                 AiocqhttpMessageEvent,
             )
+
             if not isinstance(event, AiocqhttpMessageEvent):
                 return
             if event.get_group_id():
@@ -246,10 +340,10 @@ class ChatMergerPlugin(Star):
         return max(min_delay, min(max_delay, delay))
 
     def _calc_queue_delay(self, user_id: str) -> float:
-        messages = self.message_queues[user_id]
-        if not messages:
+        items = self.message_queues[user_id]
+        if not items:
             return 0
-        total_text = "\n".join(messages)
+        total_text = "\n".join(item["text"] for item in items if item["text"])
         return self._calc_delay_for_text(total_text)
 
     # ── Timer management ─────────────────────────────────────
@@ -278,14 +372,16 @@ class ChatMergerPlugin(Star):
     # ── Core: send merged message via re-injection ───────────
 
     async def _send_merged(self, user_id: str) -> None:
-        messages = self.message_queues[user_id]
-        if not messages:
+        items = self.message_queues[user_id]
+        if not items:
             return
 
         self._stop_typing(user_id)
 
         # AI busy check: wait for AI to finish before injecting
-        if self._get_config("ai_busy_wait_enabled", True) and self._ai_busy.get(user_id, False):
+        if self._get_config("ai_busy_wait_enabled", True) and self._ai_busy.get(
+            user_id, False
+        ):
             # Cancel existing wait task to avoid duplicates
             if user_id in self._ai_busy_wait_tasks:
                 self._ai_busy_wait_tasks[user_id].cancel()
@@ -294,23 +390,25 @@ class ChatMergerPlugin(Star):
             self._ai_busy_wait_tasks[user_id] = task
             return
 
-        merged = "\n".join(messages)
+        merged = "\n".join(item["text"] for item in items if item["text"])
+        components = [comp for item in items for comp in item.get("components", [])]
         event = self._event_refs.get(user_id)
         if not event:
-            self._log(f"[{user_id}] 未找到事件引用，丢弃 {len(messages)} 条消息")
+            self._log(f"[{user_id}] 未找到事件引用，丢弃 {len(items)} 条消息")
             self.message_queues[user_id] = []
             return
 
         word_count = count_words(merged)
         self._log(
-            f"[{user_id}] >>> 发送合并消息: {len(messages)}条, {word_count}字, 内容: {merged[:80]}"
+            f"[{user_id}] >>> 发送合并消息: {len(items)}条, {word_count}字, 内容: {merged[:80]}"
         )
 
         event.message_str = merged
         event.message_obj.message_str = merged
-        extra = self._extra_components.get(user_id, [])
-        event.message_obj.message = [Plain(merged)] + extra
-        self._debug(f"[{user_id}] 消息链: 1 Plain + {len(extra)} extra components")
+        event.message_obj.message = ([Plain(merged)] if merged else []) + components
+        self._debug(
+            f"[{user_id}] 消息链: {1 if merged else 0} Plain + {len(components)} components"
+        )
 
         event._force_stopped = False
         event._result = None
@@ -322,9 +420,7 @@ class ChatMergerPlugin(Star):
         event.set_extra(MERGED_FLAG_KEY, True)
 
         self.message_queues[user_id] = []
-        self._message_items[user_id] = []
         self._event_refs.pop(user_id, None)
-        self._extra_components.pop(user_id, None)
         self.infinite_wait[user_id] = False
         self.wait_start_time.pop(user_id, None)
         self._is_typing.pop(user_id, None)
@@ -338,7 +434,7 @@ class ChatMergerPlugin(Star):
 
     # ── Main message handler ─────────────────────────────────
 
-    @filter.event_message_type(EventMessageType.ALL)
+    @filter.event_message_type(EventMessageType.PRIVATE_MESSAGE)
     async def on_message(self, event: AstrMessageEvent) -> None:
         if not self._get_config("enabled", True):
             return
@@ -361,12 +457,16 @@ class ChatMergerPlugin(Star):
                     self._timer_end_time[user_id] = time.time() + max_wait
                     task = asyncio.create_task(self._timer_callback(user_id, max_wait))
                     self.timers[user_id] = task
-                    self._debug(f"[{user_id}] 用户正在输入，重置倒计时（超时保护 {max_wait}s）")
+                    self._debug(
+                        f"[{user_id}] 用户正在输入，重置倒计时（超时保护 {max_wait}s）"
+                    )
                 elif self._is_typing.get(user_id):
                     self._is_typing[user_id] = False
                     self._cancel_timer(user_id)
                     # Recalculate delay from current queue to avoid inheriting wait_keyword delay
-                    delay = self._calc_queue_delay(user_id) or self._get_config("min_delay_seconds", 2)
+                    delay = self._calc_queue_delay(user_id) or self._get_config(
+                        "min_delay_seconds", 2
+                    )
                     self._timer_end_time[user_id] = time.time() + delay
                     task = asyncio.create_task(self._timer_callback(user_id, delay))
                     self.timers[user_id] = task
@@ -375,29 +475,34 @@ class ChatMergerPlugin(Star):
             return
 
         # ── Recall-message filter ─────────────────────────────────────────
-        if self._get_config("enable_recall_filter", True) and self._is_recall_event(event):
+        if self._get_config("enable_recall_filter", True) and self._is_recall_event(
+            event
+        ):
             try:
                 raw = event.message_obj.raw_message
                 recalled_mid = raw.get("message_id") if isinstance(raw, dict) else None
             except Exception:
                 recalled_mid = None
             user_id = event.get_sender_id()
-            if recalled_mid is not None and user_id in self._message_items:
-                before = len(self._message_items[user_id])
-                self._message_items[user_id] = [
-                    it for it in self._message_items[user_id]
-                    if str(it["message_id"]) != str(recalled_mid)
+            if recalled_mid is not None and user_id in self.message_queues:
+                before = len(self.message_queues[user_id])
+                self.message_queues[user_id] = [
+                    item
+                    for item in self.message_queues[user_id]
+                    if str(item["message_id"]) != str(recalled_mid)
                 ]
-                if len(self._message_items[user_id]) < before:
-                    self.message_queues[user_id] = [
-                        it["text"] for it in self._message_items[user_id] if it["text"]
-                    ]
-                    self._log(f"[{user_id}] 撤回消息已移除 | mid={recalled_mid} | 剩余 {len(self._message_items[user_id])} 条")
-                    if not self._message_items[user_id]:
+                remaining = len(self.message_queues[user_id])
+                if remaining < before:
+                    self._log(
+                        f"[{user_id}] 撤回消息已移除 | mid={recalled_mid} | 剩余 {remaining} 条"
+                    )
+                    if not remaining:
                         self._cancel_timer(user_id)
-                        self.message_queues[user_id] = []
                         self._event_refs.pop(user_id, None)
-                        self._message_items[user_id] = []
+                    else:
+                        self._event_refs[user_id] = self.message_queues[user_id][-1][
+                            "event"
+                        ]
             event.stop_event()
             return
 
@@ -409,15 +514,17 @@ class ChatMergerPlugin(Star):
 
         user_id = event.get_sender_id()
         text = event.message_str.strip()
+        has_reply = any(isinstance(comp, Reply) for comp in event.message_obj.message)
 
         # Image-only message: treat as wait keyword (long wait)
         is_image_only = (
             not text
+            and not has_reply
             and self._get_config("image_wait_enabled", True)
             and self._is_image_only(event)
         )
 
-        if not text and not is_image_only:
+        if not text and not is_image_only and not has_reply:
             return
 
         if event.get_extra(MERGED_FLAG_KEY):
@@ -447,23 +554,23 @@ class ChatMergerPlugin(Star):
         # Skip keyword (text only): flush entire queue + skip keyword immediately (or after random delay)
         if text and self._check_skip_words(text):
             event.stop_event()
-            self.message_queues[user_id].append(text)
-            self._message_items[user_id].append({"message_id": self._get_message_id(event), "text": text})
-            self._event_refs[user_id] = event
-            self._extra_components[user_id].extend(self._extract_extra_components(event))
+            await self._enqueue_message(user_id, event, text)
             self._cancel_timer(user_id)
             if self._get_config("skip_words_random_delay_enabled", False):
                 delay_min = float(self._get_config("skip_words_random_delay_min", 0.5))
                 delay_max = float(self._get_config("skip_words_random_delay_max", 3.0))
-                delay_min, delay_max = min(delay_min, delay_max), max(delay_min, delay_max)
+                delay_min, delay_max = (
+                    min(delay_min, delay_max),
+                    max(delay_min, delay_max),
+                )
                 rand_delay = random.uniform(delay_min, delay_max)
                 self._log(
-                    f"[{user_id}] 命中跳过词: \"{text[:30]}\" | 队列: {len(self.message_queues[user_id])}条, 随机等待 {rand_delay:.2f}s 后发送"
+                    f'[{user_id}] 命中跳过词: "{text[:30]}" | 队列: {len(self.message_queues[user_id])}条, 随机等待 {rand_delay:.2f}s 后发送'
                 )
                 self._start_timer(user_id, event, rand_delay)
             else:
                 self._log(
-                    f"[{user_id}] 命中跳过词: \"{text[:30]}\" | 队列: {len(self.message_queues[user_id])}条, 立即发送"
+                    f'[{user_id}] 命中跳过词: "{text[:30]}" | 队列: {len(self.message_queues[user_id])}条, 立即发送'
                 )
                 await self._send_merged(user_id)
             return
@@ -473,37 +580,37 @@ class ChatMergerPlugin(Star):
         if is_wait:
             event.stop_event()
             display_text = text if text else "[图片]"
-            queued_text = text if text else "[图片]"
-            self.message_queues[user_id].append(queued_text)
-            self._message_items[user_id].append({"message_id": self._get_message_id(event), "text": queued_text})
-            self._event_refs[user_id] = event
-            self._extra_components[user_id].extend(self._extract_extra_components(event))
+            await self._enqueue_message(
+                user_id,
+                event,
+                text,
+                image_only=is_image_only,
+            )
             wait_sec = self._get_config("wait_keyword_seconds", 300)
             if wait_sec == 0:
                 self.infinite_wait[user_id] = True
                 self.wait_start_time[user_id] = time.time()
                 trigger = "图片" if is_image_only else "关键词"
                 self._log(
-                    f"[{user_id}] 触发无限等待({trigger}): \"{display_text[:30]}\" | 队列: {queue_len + 1}条"
+                    f'[{user_id}] 触发无限等待({trigger}): "{display_text[:30]}" | 队列: {queue_len + 1}条'
                 )
             else:
                 random_range = self._get_config("wait_keyword_random_range", 0)
                 if random_range > 0:
-                    wait_sec = max(1, wait_sec + random.randint(-random_range, random_range))
+                    wait_sec = max(
+                        1, wait_sec + random.randint(-random_range, random_range)
+                    )
                 self.wait_start_time[user_id] = time.time()
                 trigger = "图片" if is_image_only else "关键词"
                 self._log(
-                    f"[{user_id}] 触发等待({trigger}): \"{display_text[:30]}\" | 等待: {wait_sec}秒 | 队列: {queue_len + 1}条"
+                    f'[{user_id}] 触发等待({trigger}): "{display_text[:30]}" | 等待: {wait_sec}秒 | 队列: {queue_len + 1}条'
                 )
                 self._start_timer(user_id, event, wait_sec)
             return
 
         # Normal message: stop event, queue it
         event.stop_event()
-        self.message_queues[user_id].append(text)
-        self._message_items[user_id].append({"message_id": self._get_message_id(event), "text": text})
-        self._event_refs[user_id] = event
-        self._extra_components[user_id].extend(self._extract_extra_components(event))
+        await self._enqueue_message(user_id, event, text)
         if user_id not in self.wait_start_time:
             self.wait_start_time[user_id] = time.time()
 
@@ -522,7 +629,7 @@ class ChatMergerPlugin(Star):
         # Determine delay
         delay = self._calc_queue_delay(user_id)
         self._log(
-            f"[{user_id}] 收到消息: \"{text[:30]}\" | 队列: {new_queue_len}条 | 等待: {delay:.0f}秒后发送"
+            f'[{user_id}] 收到消息: "{text[:30]}" | 队列: {new_queue_len}条 | 等待: {delay:.0f}秒后发送'
         )
         self._start_timer(user_id, event, delay)
 
@@ -545,7 +652,11 @@ class ChatMergerPlugin(Star):
     async def cmd_status(self, event: AstrMessageEvent):
         user_id = event.get_sender_id()
         q = len(self.message_queues[user_id])
-        w = sum(count_words(m) for m in self.message_queues[user_id])
+        w = sum(
+            count_words(item["text"])
+            for item in self.message_queues[user_id]
+            if item["text"]
+        )
         inf = "是" if self.infinite_wait.get(user_id, False) else "否"
         elapsed = ""
         start = self.wait_start_time.get(user_id)
@@ -574,7 +685,6 @@ class ChatMergerPlugin(Star):
         self.infinite_wait[user_id] = False
         self.wait_start_time.pop(user_id, None)
         self._event_refs.pop(user_id, None)
-        self._extra_components[user_id] = []
         yield event.plain_result("[消息合并] 已清空消息队列")
 
     @filter.command("合并配置", desc="查看当前合并配置")
@@ -622,13 +732,11 @@ class ChatMergerPlugin(Star):
         for uid in list(self._typing_tasks.keys()):
             self._stop_typing(uid)
         self.message_queues.clear()
-        self._message_items.clear()
         self._event_refs.clear()
         self.infinite_wait.clear()
         self.wait_start_time.clear()
         self._ai_busy.clear()
         self._ai_busy_wait_tasks.clear()
-        self._extra_components.clear()
         self._is_typing.clear()
         self._timer_end_time.clear()
         self._calc_delay.clear()
