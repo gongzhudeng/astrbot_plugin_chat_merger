@@ -9,12 +9,21 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import EventMessageType
 from astrbot.api.star import Context, Star, register
-from astrbot.core.message.components import Image, Plain, Record, Reply
-from astrbot.core.provider.provider import STTProvider
+from astrbot.core.message.components import (
+    ComponentType,
+    Image,
+    Plain,
+    Record,
+    Reply,
+    Video,
+)
+from astrbot.core.provider.provider import Provider, STTProvider
 from astrbot.core.utils.quoted_message_parser import (
     extract_quoted_message_images,
     extract_quoted_message_text,
 )
+
+from .image_caption import DEFAULT_IMAGE_CAPTION_PROMPT, caption_ordered_images
 
 try:
     from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
@@ -40,7 +49,7 @@ MERGED_FLAG_KEY = "chat_merger_merged"
     "astrbot_plugin_chat_merger",
     "灵犀 · 消息合并助手",
     '彻底告别一问一答式AI聊天。自动合并连续消息、智能延迟后统一回复，AI思考时显示"对方正在输入…"。支持关键词触发超长等待、图片智能合并、等待时间随机波动、AI忙感知自动排队、LLM智能延迟判断、输入状态感知、撤回消息过滤，让AI对话真正拥有真人聊天的节奏感',
-    "2.0.4",
+    "2.4.0",
     "https://github.com/gongzhudeng/astrbot_plugin_chat_merger",
 )
 class ChatMergerPlugin(Star):
@@ -148,8 +157,46 @@ class ChatMergerPlugin(Star):
             providers.append(provider)
         return providers
 
+    def _image_providers(self) -> list[Provider]:
+        providers = []
+        seen = set()
+        for key in (
+            "image_caption_provider_id",
+            "image_caption_fallback_provider_id",
+            "image_caption_fallback_provider_id_2",
+        ):
+            provider_id = str(self._get_config(key, "") or "").strip()
+            if not provider_id:
+                continue
+            provider = self.context.get_provider_by_id(provider_id)
+            if not isinstance(provider, Provider):
+                self._log(f"图片转述 Provider 不可用或类型不正确: {provider_id}")
+                continue
+            identity = id(provider)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            providers.append(provider)
+        return providers
+
+    def _image_refusal_keywords(self) -> list[str]:
+        configured = self._get_config(
+            "image_caption_refusal_keywords",
+            [
+                "无法协助",
+                "不能协助",
+                "无法描述",
+                "不能描述",
+                "抱歉，我不能",
+                "i can't help",
+                "i cannot help",
+                "unable to assist",
+            ],
+        )
+        return [str(item) for item in configured if str(item).strip()]
+
     @staticmethod
-    def _provider_name(provider: STTProvider) -> str:
+    def _provider_name(provider) -> str:
         try:
             return str(provider.meta().id)
         except Exception:
@@ -217,29 +264,193 @@ class ChatMergerPlugin(Star):
     def _is_contains_mode(mode_str: str) -> bool:
         return mode_str in ("contains", "包含")
 
-    @staticmethod
-    def _is_image_only(event: AstrMessageEvent) -> bool:
+    @classmethod
+    def _is_image_only(cls, event: AstrMessageEvent) -> bool:
         """Check if message contains only images (no text or voice)."""
         has_image = False
         has_text = False
         has_other_content = False
         for comp in event.message_obj.message:
-            if isinstance(comp, Image):
+            if cls._is_image_component(comp):
                 has_image = True
             elif isinstance(comp, Plain) and comp.text.strip():
                 has_text = True
-            elif isinstance(comp, Record):
+            elif isinstance(comp, Record) or cls._is_video_component(comp):
                 has_other_content = True
         return has_image and not has_text and not has_other_content
 
     @staticmethod
-    def _extract_preserved_components(event: AstrMessageEvent) -> list:
-        """Preserve current-message attachments without replaying quote or voice metadata."""
-        return [
-            comp
-            for comp in event.message_obj.message
-            if not isinstance(comp, (Plain, Record, Reply))
-        ]
+    def _component_type_is(component, expected: ComponentType) -> bool:
+        value = getattr(component, "type", None)
+        if value == expected:
+            return True
+        return (
+            str(getattr(value, "value", value) or "").lower() == expected.value.lower()
+        )
+
+    @classmethod
+    def _is_video_component(cls, component) -> bool:
+        return isinstance(component, Video) or cls._component_type_is(
+            component, ComponentType.Video
+        )
+
+    @classmethod
+    def _is_image_component(cls, component) -> bool:
+        return isinstance(component, Image) or cls._component_type_is(
+            component, ComponentType.Image
+        )
+
+    @staticmethod
+    def _raw_message_has_video(event: AstrMessageEvent) -> bool:
+        raw = getattr(event.message_obj, "raw_message", None)
+        if raw is None:
+            return False
+        try:
+            message = raw.get("message")
+        except (AttributeError, TypeError):
+            message = getattr(raw, "message", None)
+        return isinstance(message, list) and any(
+            isinstance(segment, dict) and segment.get("type") == "video"
+            for segment in message
+        )
+
+    @classmethod
+    def _has_direct_video(cls, event: AstrMessageEvent) -> bool:
+        return any(cls._is_video_component(comp) for comp in event.message_obj.message)
+
+    @classmethod
+    def _reply_contains_video(cls, reply: Reply, quoted_text: str) -> bool:
+        if any(cls._is_video_component(comp) for comp in list(reply.chain or [])):
+            return True
+        candidates = (quoted_text, str(reply.message_str or ""))
+        return any(
+            marker in candidate.lower()
+            for candidate in candidates
+            for marker in ("[video]", "[视频]", "[引用视频消息]")
+        )
+
+    @classmethod
+    def _ordered_message_parts(
+        cls,
+        event: AstrMessageEvent,
+        text: str,
+        *,
+        source_type: str,
+        quote_contexts: list[str],
+        image_only: bool,
+        video_only: bool,
+    ) -> list[dict]:
+        parts = [{"kind": "text", "text": value} for value in quote_contexts]
+        if source_type == "voice":
+            if text:
+                parts.append({"kind": "text", "text": text})
+            return parts
+
+        saw_text = False
+        for component in event.message_obj.message:
+            if isinstance(component, (Reply, Record)):
+                continue
+            if isinstance(component, Plain):
+                value = component.text.strip()
+                if value:
+                    parts.append({"kind": "text", "text": value})
+                    saw_text = True
+            elif cls._is_image_component(component):
+                parts.append({"kind": "image", "component": component})
+            elif cls._is_video_component(component):
+                parts.append({"kind": "video", "component": component})
+            else:
+                parts.append({"kind": "component", "component": component})
+
+        if text and not saw_text:
+            parts.append({"kind": "text", "text": text})
+        elif image_only and not any(part["kind"] == "image" for part in parts):
+            parts.append({"kind": "text", "text": "[图片]"})
+        elif video_only and not any(part["kind"] == "video" for part in parts):
+            parts.append({"kind": "text", "text": "[视频]"})
+        return parts
+
+    @staticmethod
+    def _number_media_parts(parts: list[dict]) -> None:
+        image_index = 0
+        video_index = 0
+        for part in parts:
+            if part["kind"] == "image":
+                image_index += 1
+                part["id"] = f"图{image_index}"
+            elif part["kind"] == "video":
+                video_index += 1
+                part["id"] = f"视频{video_index}"
+
+    async def _caption_images(self, parts: list[dict]) -> dict[str, str]:
+        if not any(part["kind"] == "image" for part in parts):
+            return {}
+        if not self._get_config("image_caption_enabled", False):
+            return {}
+        providers = self._image_providers()
+        if not providers:
+            self._log("未配置可用的图片转述模型，图片将以失败占位交给主模型")
+            return {}
+        return await caption_ordered_images(
+            parts,
+            providers=providers,
+            prompt=str(
+                self._get_config("image_caption_prompt", DEFAULT_IMAGE_CAPTION_PROMPT)
+                or DEFAULT_IMAGE_CAPTION_PROMPT
+            ),
+            refusal_keywords=self._image_refusal_keywords(),
+            timeout_seconds=float(
+                self._get_config("image_caption_timeout_seconds", 60) or 60
+            ),
+            max_images=max(
+                1, int(self._get_config("image_caption_max_images", 9) or 9)
+            ),
+        )
+
+    @staticmethod
+    def _render_parts(
+        parts: list[dict],
+        image_captions: dict[str, str],
+        *,
+        preserve_images: bool = False,
+    ) -> tuple[str, list]:
+        text_lines: list[str] = []
+        replay_components: list = []
+        for part in parts:
+            kind = part["kind"]
+            if kind == "text":
+                value = str(part.get("text", "")).strip()
+                if value:
+                    text_lines.append(value)
+                    replay_components.append(Plain(value))
+            elif kind == "image":
+                image_id = str(part["id"])
+                if preserve_images:
+                    placeholder = f"[{image_id}]"
+                    text_lines.append(placeholder)
+                    replay_components.extend([Plain(placeholder), part["component"]])
+                    continue
+                description = image_captions.get(image_id, "").strip()
+                if description:
+                    value = (
+                        f'<image_context id="{image_id}">{html.escape(description)}'
+                        "</image_context>"
+                    )
+                else:
+                    value = (
+                        f'<image_context id="{image_id}" status="failed">'
+                        "图片转述失败</image_context>"
+                    )
+                text_lines.append(value)
+                replay_components.append(Plain(value))
+            elif kind == "video":
+                video_id = str(part["id"])
+                placeholder = f"[{video_id}]"
+                text_lines.append(placeholder)
+                replay_components.extend([Plain(placeholder), part["component"]])
+            else:
+                replay_components.append(part["component"])
+        return "\n".join(text_lines), replay_components
 
     @staticmethod
     def _format_quoted_message(
@@ -247,6 +458,8 @@ class ChatMergerPlugin(Star):
         reply: Reply,
         text: str,
         image_count: int,
+        *,
+        has_video: bool = False,
     ) -> str:
         sender = reply.sender_nickname or (
             f"user_id:{reply.sender_id}" if reply.sender_id else "未知发送者"
@@ -258,7 +471,11 @@ class ChatMergerPlugin(Star):
         )
         content_parts = []
         if text and text != "[Empty Text]":
-            content_parts.append(text)
+            normalized_text = text.replace("[Video]", "").replace("[视频]", "").strip()
+            if normalized_text:
+                content_parts.append(normalized_text)
+        if has_video:
+            content_parts.append("[引用视频消息]")
         if image_count:
             content_parts.append(f"[引用图片: {image_count}张]")
         if not content_parts:
@@ -280,8 +497,9 @@ class ChatMergerPlugin(Star):
         delay_text: str | None = None,
         wait_trigger: bool = False,
         image_only: bool = False,
+        video_only: bool = False,
     ) -> dict:
-        text_parts = []
+        quote_contexts = []
         quote_images = []
         for comp in event.message_obj.message:
             if not isinstance(comp, Reply):
@@ -293,29 +511,44 @@ class ChatMergerPlugin(Star):
                 self._log(f"引用消息解析失败 | reply_id={comp.id} | {e}")
                 quoted_text = comp.message_str or ""
                 quoted_images = []
-            text_parts.append(
+            has_video = self._reply_contains_video(comp, quoted_text)
+            quote_contexts.append(
                 self._format_quoted_message(
                     event,
                     comp,
                     quoted_text,
                     len(quoted_images),
+                    has_video=has_video,
                 )
             )
             quote_images.extend(Image(file=image_ref) for image_ref in quoted_images)
 
-        if text:
-            text_parts.append(text)
-        elif image_only:
-            text_parts.append("[图片]")
-
-        final_text = "\n".join(text_parts).strip()
+        parts = [
+            {"kind": "component", "component": image} for image in quote_images
+        ] + self._ordered_message_parts(
+            event,
+            text,
+            source_type=source_type,
+            quote_contexts=quote_contexts,
+            image_only=image_only,
+            video_only=video_only,
+        )
+        preview_parts = []
+        for part in parts:
+            if part["kind"] == "text":
+                preview_parts.append(str(part.get("text", "")))
+            elif part["kind"] == "image":
+                preview_parts.append("[图片]")
+            elif part["kind"] == "video":
+                preview_parts.append("[视频]")
+        preview_text = "\n".join(value for value in preview_parts if value).strip()
         return {
             "message_id": self._get_message_id(event),
-            "text": final_text,
-            "delay_text": final_text if delay_text is None else delay_text,
+            "text": preview_text,
+            "delay_text": preview_text if delay_text is None else delay_text,
             "source_type": source_type,
             "wait_trigger": wait_trigger,
-            "components": quote_images + self._extract_preserved_components(event),
+            "parts": parts,
             "event": event,
         }
 
@@ -329,6 +562,7 @@ class ChatMergerPlugin(Star):
         delay_text: str | None = None,
         wait_trigger: bool = False,
         image_only: bool = False,
+        video_only: bool = False,
     ) -> dict:
         item = await self._build_queue_item(
             event,
@@ -337,6 +571,7 @@ class ChatMergerPlugin(Star):
             delay_text=delay_text,
             wait_trigger=wait_trigger,
             image_only=image_only,
+            video_only=video_only,
         )
         self.message_queues[user_id].append(item)
         self._event_refs[user_id] = event
@@ -568,8 +803,15 @@ class ChatMergerPlugin(Star):
             self._ai_busy_wait_tasks[user_id] = task
             return
 
-        merged = "\n".join(item["text"] for item in items if item["text"])
-        components = [comp for item in items for comp in item.get("components", [])]
+        all_parts = [part for item in items for part in item.get("parts", [])]
+        self._number_media_parts(all_parts)
+        image_caption_enabled = self._get_config("image_caption_enabled", False)
+        image_captions = await self._caption_images(all_parts)
+        merged, replay_components = self._render_parts(
+            all_parts,
+            image_captions,
+            preserve_images=not image_caption_enabled,
+        )
         event = self._event_refs.get(user_id)
         if not event:
             self._log(f"[{user_id}] 未找到事件引用，丢弃 {len(items)} 条消息")
@@ -583,10 +825,8 @@ class ChatMergerPlugin(Star):
 
         event.message_str = merged
         event.message_obj.message_str = merged
-        event.message_obj.message = ([Plain(merged)] if merged else []) + components
-        self._debug(
-            f"[{user_id}] 消息链: {1 if merged else 0} Plain + {len(components)} components"
-        )
+        event.message_obj.message = replay_components
+        self._debug(f"[{user_id}] 消息链: {len(replay_components)} ordered components")
 
         event._force_stopped = False
         event._result = None
@@ -694,6 +934,8 @@ class ChatMergerPlugin(Star):
         user_id = event.get_sender_id()
         text = event.message_str.strip()
         has_reply = any(isinstance(comp, Reply) for comp in event.message_obj.message)
+        has_direct_video = self._has_direct_video(event)
+        raw_has_video = self._raw_message_has_video(event)
 
         if event.get_extra(MERGED_FLAG_KEY):
             # Route through Path A (handler yields ProviderRequest) to set _has_send_oper.
@@ -723,30 +965,52 @@ class ChatMergerPlugin(Star):
 
         # Image-only message: treat as wait keyword (long wait)
         is_image_only = (
-            not is_voice
-            and not text
-            and not has_reply
-            and self._get_config("image_wait_enabled", True)
-            and self._is_image_only(event)
+            not is_voice and not text and not has_reply and self._is_image_only(event)
         )
 
-        if not text and not is_image_only and not has_reply:
+        is_video_only = not is_voice and not text and not has_reply and has_direct_video
+        if raw_has_video and not has_direct_video:
+            self._log(
+                f"[{user_id}] 原始消息包含视频，但未找到可重放 Video 组件，已停止事件避免生成错误回复"
+            )
+            event.stop_event()
+            return
+
+        if not text and not is_image_only and not is_video_only and not has_reply:
             return
 
         queue_len = len(self.message_queues[user_id])
         voice_wait = is_voice and self._get_config("voice_wait_enabled", True)
+        image_wait = is_image_only and self._get_config("image_wait_enabled", True)
+        video_wait = is_video_only and self._get_config("video_wait_enabled", True)
 
-        # The current message decides the timer mode. Voice/image wait wins only for
+        # The current message decides the timer mode. Media wait wins only for
         # this message; a later normal message restores regular routing.
         is_wait_keyword = (
             not is_voice and bool(text) and self._check_wait_keywords(text)
         )
-        is_wait = voice_wait or is_image_only or is_wait_keyword
+        is_wait = voice_wait or image_wait or video_wait or is_wait_keyword
         if is_wait:
             event.stop_event()
-            source_type = "voice" if is_voice else "image" if is_image_only else "text"
+            source_type = (
+                "voice"
+                if is_voice
+                else "image"
+                if is_image_only
+                else "video"
+                if is_video_only
+                else "text"
+            )
             delay_text = voice_text if is_voice else None
-            display_text = voice_text if is_voice else text if text else "[图片]"
+            display_text = (
+                voice_text
+                if is_voice
+                else text
+                if text
+                else "[视频]"
+                if is_video_only
+                else "[图片]"
+            )
             await self._enqueue_message(
                 user_id,
                 event,
@@ -755,11 +1019,20 @@ class ChatMergerPlugin(Star):
                 delay_text=delay_text,
                 wait_trigger=True,
                 image_only=is_image_only,
+                video_only=is_video_only,
             )
             self._cancel_timer(user_id)
             self.infinite_wait[user_id] = False
             wait_sec = self._get_config("wait_keyword_seconds", 300)
-            trigger = "语音" if is_voice else "图片" if is_image_only else "关键词"
+            trigger = (
+                "语音"
+                if is_voice
+                else "图片"
+                if is_image_only
+                else "视频"
+                if is_video_only
+                else "关键词"
+            )
             if wait_sec == 0:
                 self.infinite_wait[user_id] = True
                 self.wait_start_time[user_id] = time.time()
@@ -812,8 +1085,9 @@ class ChatMergerPlugin(Star):
             user_id,
             event,
             text,
-            source_type="voice" if is_voice else "text",
+            source_type=("voice" if is_voice else "video" if is_video_only else "text"),
             delay_text=voice_text if is_voice else text,
+            video_only=is_video_only,
         )
         if user_id not in self.wait_start_time:
             self.wait_start_time[user_id] = time.time()
@@ -832,7 +1106,7 @@ class ChatMergerPlugin(Star):
             return
 
         delay = self._calc_queue_delay(user_id)
-        display_text = voice_text if is_voice else text
+        display_text = voice_text if is_voice else "[视频]" if is_video_only else text
         self._log(
             f'[{user_id}] 收到消息: "{display_text[:30]}" | 队列: {new_queue_len}条 | 等待: {delay:.0f}秒后发送'
         )
@@ -915,6 +1189,11 @@ class ChatMergerPlugin(Star):
             f"输入状态显示: {self._get_config('typing_status_enabled', True)}",
             f"输入状态间隔: {self._get_config('typing_interval', 0.5)}秒",
             f"图片触发超长等待: {self._get_config('image_wait_enabled', True)}",
+            f"视频触发超长等待: {self._get_config('video_wait_enabled', True)}",
+            f"插件级图片转述: {self._get_config('image_caption_enabled', False)}",
+            f"首选图片转述模型: {self._get_config('image_caption_provider_id', '') or '未配置'}",
+            f"一级图片转述兜底: {self._get_config('image_caption_fallback_provider_id', '') or '未配置'}",
+            f"二级图片转述兜底: {self._get_config('image_caption_fallback_provider_id_2', '') or '未配置'}",
             f"语音消息感知: {self._get_config('voice_message_enabled', True)}",
             f"语音触发超长等待: {self._get_config('voice_wait_enabled', True)}",
             f"首选 STT: {self._get_config('stt_provider_id', '') or '未配置'}",

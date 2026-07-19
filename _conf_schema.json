@@ -124,6 +124,12 @@
                 "hint": "开启后，当前收到的语音消息会直接触发超长等待，不受转写字数和消息条数阈值影响；后续普通文字会恢复普通延迟规则",
                 "type": "bool",
                 "default": true
+            },
+            "video_wait_enabled": {
+                "description": "视频触发超长等待",
+                "hint": "开启后，单独发送视频会触发超长等待，并与随后发送的文字合并为同一个 LLM 请求",
+                "type": "bool",
+                "default": true
             }
         }
     },
@@ -169,6 +175,62 @@
                 "hint": "每次等待语音文件就绪的时间",
                 "type": "float",
                 "default": 0.5
+            }
+        }
+    },
+    "图片消息": {
+        "description": "插件级图片理解配置；启用后主聊天模型不再直接接收原图片",
+        "type": "object",
+        "items": {
+            "image_caption_enabled": {
+                "description": "启用插件级图片转述",
+                "hint": "默认关闭；请先配置可识图的首选或兜底模型，再手动开启。开启后按图文顺序转述图片，并将结构化文字交给主聊天模型",
+                "type": "bool",
+                "default": false
+            },
+            "image_caption_provider_id": {
+                "description": "首选图片转述模型",
+                "hint": "请选择支持图片输入的模型",
+                "type": "string",
+                "default": "",
+                "_special": "select_provider"
+            },
+            "image_caption_fallback_provider_id": {
+                "description": "一级图片转述兜底模型",
+                "hint": "首选模型异常、返回空内容或拒绝内容时尝试",
+                "type": "string",
+                "default": "",
+                "_special": "select_provider"
+            },
+            "image_caption_fallback_provider_id_2": {
+                "description": "二级图片转述兜底模型",
+                "hint": "一级兜底仍失败时最后尝试",
+                "type": "string",
+                "default": "",
+                "_special": "select_provider"
+            },
+            "image_caption_prompt": {
+                "description": "图片转述提示词",
+                "hint": "用户同轮发送的文字和带编号图片会按原顺序追加到此提示词之后",
+                "type": "text",
+                "default": "请结合图片在消息中的出现顺序和相邻文字，分别客观转述每张图片。识别人物、动作、场景、可读文字和与用户问题有关的信息，不要编造。"
+            },
+            "image_caption_refusal_keywords": {
+                "description": "图片模型拒绝判定关键词",
+                "hint": "首选模型返回内容命中任一关键词时视为拒绝，并自动尝试兜底模型",
+                "type": "list",
+                "default": ["无法协助", "不能协助", "无法描述", "不能描述", "抱歉，我不能", "i can't help", "i cannot help", "unable to assist"]
+            },
+            "image_caption_max_images": {
+                "description": "单轮最大图片转述数量",
+                "hint": "超过数量的图片保留失败占位，防止单次请求过大",
+                "type": "int",
+                "default": 9
+            },
+            "image_caption_timeout_seconds": {
+                "description": "单个图片模型超时时间（秒）",
+                "type": "float",
+                "default": 60
             }
         }
     },
