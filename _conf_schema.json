@@ -227,6 +227,17 @@
                 "type": "int",
                 "default": 9
             },
+            "max_image_context_details": {
+                "description": "最大保留完整图片上下文数量",
+                "hint": "超过数量后，仅把更旧的成功图片转述替换为轻量标记，用户原话和 AI 回复保持不变。0 表示不限制。",
+                "type": "int",
+                "slider": {
+                    "min": 0,
+                    "max": 20,
+                    "step": 1
+                },
+                "default": 3
+            },
             "image_caption_timeout_seconds": {
                 "description": "单个图片模型超时时间（秒）",
                 "type": "float",

@@ -8,6 +8,7 @@ from collections import defaultdict
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import EventMessageType
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core.message.components import (
     ComponentType,
@@ -24,6 +25,11 @@ from astrbot.core.utils.quoted_message_parser import (
 )
 
 from .image_caption import DEFAULT_IMAGE_CAPTION_PROMPT, caption_ordered_images
+from .image_context import (
+    count_image_contexts,
+    prune_image_contexts,
+    wrap_image_context,
+)
 
 try:
     from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
@@ -49,7 +55,7 @@ MERGED_FLAG_KEY = "chat_merger_merged"
     "astrbot_plugin_chat_merger",
     "灵犀 · 消息合并助手",
     '彻底告别一问一答式AI聊天。自动合并连续消息、智能延迟后统一回复，AI思考时显示"对方正在输入…"。支持关键词触发超长等待、图片智能合并、等待时间随机波动、AI忙感知自动排队、LLM智能延迟判断、输入状态感知、撤回消息过滤，让AI对话真正拥有真人聊天的节奏感',
-    "2.4.0",
+    "2.5.0",
     "https://github.com/gongzhudeng/astrbot_plugin_chat_merger",
 )
 class ChatMergerPlugin(Star):
@@ -432,7 +438,7 @@ class ChatMergerPlugin(Star):
                     continue
                 description = image_captions.get(image_id, "").strip()
                 if description:
-                    value = (
+                    value = wrap_image_context(
                         f'<image_context id="{image_id}">{html.escape(description)}'
                         "</image_context>"
                     )
@@ -850,6 +856,23 @@ class ChatMergerPlugin(Star):
         except Exception as e:
             self._log(f"[{user_id}] 重新注入事件失败: {e}")
 
+    @filter.on_llm_request(priority=9_999)
+    async def prune_image_context_history(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+    ) -> None:
+        del event
+        limit = max(0, int(self._get_config("max_image_context_details", 3) or 0))
+        incoming_details = count_image_contexts(req.prompt)
+        pruned = prune_image_contexts(
+            list(req.contexts or []),
+            max_details=limit,
+            incoming_details=incoming_details,
+        )
+        if pruned:
+            self._log(f"已清理 {pruned} 个旧图片解析上下文")
+
     # ── Main message handler ─────────────────────────────────
 
     @filter.event_message_type(EventMessageType.PRIVATE_MESSAGE)
@@ -1191,6 +1214,7 @@ class ChatMergerPlugin(Star):
             f"图片触发超长等待: {self._get_config('image_wait_enabled', True)}",
             f"视频触发超长等待: {self._get_config('video_wait_enabled', True)}",
             f"插件级图片转述: {self._get_config('image_caption_enabled', False)}",
+            f"图片上下文完整保留: {self._get_config('max_image_context_details', 3)}张 (0=不限制)",
             f"首选图片转述模型: {self._get_config('image_caption_provider_id', '') or '未配置'}",
             f"一级图片转述兜底: {self._get_config('image_caption_fallback_provider_id', '') or '未配置'}",
             f"二级图片转述兜底: {self._get_config('image_caption_fallback_provider_id_2', '') or '未配置'}",
