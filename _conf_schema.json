@@ -118,6 +118,57 @@
                 "hint": "开启后，单独发送图片（不带文字）会自动触发超长等待，等同于触发等待关键词",
                 "type": "bool",
                 "default": true
+            },
+            "voice_wait_enabled": {
+                "description": "语音触发超长等待",
+                "hint": "开启后，当前收到的语音消息会直接触发超长等待，不受转写字数和消息条数阈值影响；后续普通文字会恢复普通延迟规则",
+                "type": "bool",
+                "default": true
+            }
+        }
+    },
+    "语音消息": {
+        "description": "语音来源感知和插件级语音识别配置",
+        "type": "object",
+        "items": {
+            "voice_message_enabled": {
+                "description": "启用语音消息感知",
+                "hint": "开启后识别语音来源，并用结构化标签交给模型；关闭后不执行插件级语音识别",
+                "type": "bool",
+                "default": true
+            },
+            "stt_provider_id": {
+                "description": "首选 STT 模型",
+                "hint": "语音识别时最先尝试的模型；留空则直接尝试后续兜底模型",
+                "type": "string",
+                "default": "",
+                "_special": "select_provider_stt"
+            },
+            "stt_fallback_provider_id": {
+                "description": "一级 STT 兜底模型",
+                "hint": "首选模型未配置或识别失败时尝试",
+                "type": "string",
+                "default": "",
+                "_special": "select_provider_stt"
+            },
+            "stt_fallback_provider_id_2": {
+                "description": "二级 STT 兜底模型",
+                "hint": "一级兜底仍失败时最后尝试；不会自动使用当前会话 STT",
+                "type": "string",
+                "default": "",
+                "_special": "select_provider_stt"
+            },
+            "stt_file_ready_retries": {
+                "description": "语音文件就绪重试次数",
+                "hint": "NapCat 语音文件暂未写入完成时的重试次数",
+                "type": "int",
+                "default": 5
+            },
+            "stt_file_ready_interval": {
+                "description": "语音文件重试间隔（秒）",
+                "hint": "每次等待语音文件就绪的时间",
+                "type": "float",
+                "default": 0.5
             }
         }
     },

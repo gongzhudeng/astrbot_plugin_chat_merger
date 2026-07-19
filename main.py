@@ -9,7 +9,8 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import EventMessageType
 from astrbot.api.star import Context, Star, register
-from astrbot.core.message.components import Image, Plain, Reply
+from astrbot.core.message.components import Image, Plain, Record, Reply
+from astrbot.core.provider.provider import STTProvider
 from astrbot.core.utils.quoted_message_parser import (
     extract_quoted_message_images,
     extract_quoted_message_text,
@@ -92,28 +93,152 @@ class ChatMergerPlugin(Star):
         return "".join(parts).strip()
 
     @staticmethod
+    def _raw_message_has_voice(event: AstrMessageEvent) -> bool:
+        raw = getattr(event.message_obj, "raw_message", None)
+        if raw is None:
+            return False
+        try:
+            message = raw.get("message")
+        except (AttributeError, TypeError):
+            message = getattr(raw, "message", None)
+        if not isinstance(message, list):
+            return False
+        return any(
+            isinstance(segment, dict) and segment.get("type") == "record"
+            for segment in message
+        )
+
+    @staticmethod
+    def _get_record(event: AstrMessageEvent) -> Record | None:
+        return next(
+            (comp for comp in event.message_obj.message if isinstance(comp, Record)),
+            None,
+        )
+
+    @staticmethod
+    def _format_voice_message(text: str, *, failed: bool = False) -> str:
+        source = "speech_to_text_failed" if failed else "speech_to_text"
+        content = text.strip() or "[语音识别失败]"
+        return (
+            f'<voice_message speaker="user" source="{source}">\n'
+            f"{html.escape(content)}\n"
+            "</voice_message>"
+        )
+
+    def _stt_providers(self) -> list[STTProvider]:
+        providers = []
+        seen = set()
+        config_keys = (
+            "stt_provider_id",
+            "stt_fallback_provider_id",
+            "stt_fallback_provider_id_2",
+        )
+        for key in config_keys:
+            provider_id = str(self._get_config(key, "") or "").strip()
+            if not provider_id:
+                continue
+            provider = self.context.get_provider_by_id(provider_id)
+            if not isinstance(provider, STTProvider):
+                self._log(f"STT Provider 不可用或类型不正确: {provider_id}")
+                continue
+            identity = id(provider)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            providers.append(provider)
+        return providers
+
+    @staticmethod
+    def _provider_name(provider: STTProvider) -> str:
+        try:
+            return str(provider.meta().id)
+        except Exception:
+            return type(provider).__name__
+
+    async def _transcribe_record(self, record: Record) -> str:
+        try:
+            audio_path = await record.convert_to_file_path()
+        except Exception as e:
+            self._log(f"获取语音文件失败: {e}")
+            return ""
+
+        retries = max(1, int(self._get_config("stt_file_ready_retries", 5)))
+        interval = max(0.0, float(self._get_config("stt_file_ready_interval", 0.5)))
+        for provider in self._stt_providers():
+            for attempt in range(retries):
+                try:
+                    text = str(
+                        await provider.get_text(audio_url=audio_path) or ""
+                    ).strip()
+                    if text:
+                        self._debug(
+                            f"STT Provider {self._provider_name(provider)} 识别成功"
+                        )
+                        return text
+                    self._log(
+                        f"STT Provider {self._provider_name(provider)} 返回空结果，尝试下一个"
+                    )
+                    break
+                except FileNotFoundError:
+                    if attempt + 1 >= retries:
+                        self._log(
+                            f"语音文件未就绪，STT Provider {self._provider_name(provider)} 重试耗尽"
+                        )
+                        break
+                    await asyncio.sleep(interval)
+                except Exception as e:
+                    self._log(
+                        f"STT Provider {self._provider_name(provider)} 识别失败，尝试下一个: {e}"
+                    )
+                    break
+        return ""
+
+    async def _resolve_voice(
+        self, event: AstrMessageEvent, text: str
+    ) -> tuple[bool, str]:
+        if not self._get_config("voice_message_enabled", True):
+            return False, text
+
+        record = self._get_record(event)
+        raw_has_voice = self._raw_message_has_voice(event)
+        if record is None and not raw_has_voice:
+            return False, text
+
+        if record is not None:
+            transcript = await self._transcribe_record(record)
+        else:
+            transcript = text.strip()
+
+        if transcript:
+            return True, transcript
+        return True, ""
+
+    @staticmethod
     def _is_contains_mode(mode_str: str) -> bool:
         return mode_str in ("contains", "包含")
 
     @staticmethod
     def _is_image_only(event: AstrMessageEvent) -> bool:
-        """Check if message contains only images (no text)."""
+        """Check if message contains only images (no text or voice)."""
         has_image = False
         has_text = False
+        has_other_content = False
         for comp in event.message_obj.message:
             if isinstance(comp, Image):
                 has_image = True
             elif isinstance(comp, Plain) and comp.text.strip():
                 has_text = True
-        return has_image and not has_text
+            elif isinstance(comp, Record):
+                has_other_content = True
+        return has_image and not has_text and not has_other_content
 
     @staticmethod
     def _extract_preserved_components(event: AstrMessageEvent) -> list:
-        """Preserve current-message attachments without replaying quote metadata."""
+        """Preserve current-message attachments without replaying quote or voice metadata."""
         return [
             comp
             for comp in event.message_obj.message
-            if not isinstance(comp, (Plain, Reply))
+            if not isinstance(comp, (Plain, Record, Reply))
         ]
 
     @staticmethod
@@ -151,6 +276,9 @@ class ChatMergerPlugin(Star):
         event: AstrMessageEvent,
         text: str,
         *,
+        source_type: str = "text",
+        delay_text: str | None = None,
+        wait_trigger: bool = False,
         image_only: bool = False,
     ) -> dict:
         text_parts = []
@@ -180,9 +308,13 @@ class ChatMergerPlugin(Star):
         elif image_only:
             text_parts.append("[图片]")
 
+        final_text = "\n".join(text_parts).strip()
         return {
             "message_id": self._get_message_id(event),
-            "text": "\n".join(text_parts).strip(),
+            "text": final_text,
+            "delay_text": final_text if delay_text is None else delay_text,
+            "source_type": source_type,
+            "wait_trigger": wait_trigger,
             "components": quote_images + self._extract_preserved_components(event),
             "event": event,
         }
@@ -193,9 +325,19 @@ class ChatMergerPlugin(Star):
         event: AstrMessageEvent,
         text: str,
         *,
+        source_type: str = "text",
+        delay_text: str | None = None,
+        wait_trigger: bool = False,
         image_only: bool = False,
     ) -> dict:
-        item = await self._build_queue_item(event, text, image_only=image_only)
+        item = await self._build_queue_item(
+            event,
+            text,
+            source_type=source_type,
+            delay_text=delay_text,
+            wait_trigger=wait_trigger,
+            image_only=image_only,
+        )
         self.message_queues[user_id].append(item)
         self._event_refs[user_id] = event
         return item
@@ -343,7 +485,11 @@ class ChatMergerPlugin(Star):
         items = self.message_queues[user_id]
         if not items:
             return 0
-        total_text = "\n".join(item["text"] for item in items if item["text"])
+        total_text = "\n".join(
+            item.get("delay_text", item["text"])
+            for item in items
+            if item.get("delay_text", item["text"])
+        )
         return self._calc_delay_for_text(total_text)
 
     # ── Timer management ─────────────────────────────────────
@@ -368,6 +514,38 @@ class ChatMergerPlugin(Star):
         if self.infinite_wait.get(user_id, False):
             return
         await self._send_merged(user_id)
+
+    def _restore_timer_from_last_item(self, user_id: str) -> None:
+        items = self.message_queues[user_id]
+        if not items:
+            self._cancel_timer(user_id)
+            self.infinite_wait[user_id] = False
+            self.wait_start_time.pop(user_id, None)
+            return
+
+        last_item = items[-1]
+        event = last_item["event"]
+        self._cancel_timer(user_id)
+        if last_item.get("wait_trigger", False):
+            wait_sec = self._get_config("wait_keyword_seconds", 300)
+            self.wait_start_time[user_id] = time.time()
+            if wait_sec == 0:
+                self.infinite_wait[user_id] = True
+                return
+            random_range = self._get_config("wait_keyword_random_range", 0)
+            if random_range > 0:
+                wait_sec = max(
+                    1, wait_sec + random.randint(-random_range, random_range)
+                )
+            self.infinite_wait[user_id] = False
+            self._start_timer(user_id, event, wait_sec)
+            return
+
+        self.infinite_wait[user_id] = False
+        delay = self._calc_queue_delay(user_id) or self._get_config(
+            "min_delay_seconds", 2
+        )
+        self._start_timer(user_id, event, delay)
 
     # ── Core: send merged message via re-injection ───────────
 
@@ -497,12 +675,13 @@ class ChatMergerPlugin(Star):
                         f"[{user_id}] 撤回消息已移除 | mid={recalled_mid} | 剩余 {remaining} 条"
                     )
                     if not remaining:
-                        self._cancel_timer(user_id)
+                        self._restore_timer_from_last_item(user_id)
                         self._event_refs.pop(user_id, None)
                     else:
                         self._event_refs[user_id] = self.message_queues[user_id][-1][
                             "event"
                         ]
+                        self._restore_timer_from_last_item(user_id)
             event.stop_event()
             return
 
@@ -515,17 +694,6 @@ class ChatMergerPlugin(Star):
         user_id = event.get_sender_id()
         text = event.message_str.strip()
         has_reply = any(isinstance(comp, Reply) for comp in event.message_obj.message)
-
-        # Image-only message: treat as wait keyword (long wait)
-        is_image_only = (
-            not text
-            and not has_reply
-            and self._get_config("image_wait_enabled", True)
-            and self._is_image_only(event)
-        )
-
-        if not text and not is_image_only and not has_reply:
-            return
 
         if event.get_extra(MERGED_FLAG_KEY):
             # Route through Path A (handler yields ProviderRequest) to set _has_send_oper.
@@ -549,10 +717,73 @@ class ChatMergerPlugin(Star):
             event.stop_event()
             return
 
-        queue_len = len(self.message_queues[user_id])
+        is_voice, voice_text = await self._resolve_voice(event, text)
+        if is_voice:
+            text = self._format_voice_message(voice_text, failed=not voice_text)
 
-        # Skip keyword (text only): flush entire queue + skip keyword immediately (or after random delay)
-        if text and self._check_skip_words(text):
+        # Image-only message: treat as wait keyword (long wait)
+        is_image_only = (
+            not is_voice
+            and not text
+            and not has_reply
+            and self._get_config("image_wait_enabled", True)
+            and self._is_image_only(event)
+        )
+
+        if not text and not is_image_only and not has_reply:
+            return
+
+        queue_len = len(self.message_queues[user_id])
+        voice_wait = is_voice and self._get_config("voice_wait_enabled", True)
+
+        # The current message decides the timer mode. Voice/image wait wins only for
+        # this message; a later normal message restores regular routing.
+        is_wait_keyword = (
+            not is_voice and bool(text) and self._check_wait_keywords(text)
+        )
+        is_wait = voice_wait or is_image_only or is_wait_keyword
+        if is_wait:
+            event.stop_event()
+            source_type = "voice" if is_voice else "image" if is_image_only else "text"
+            delay_text = voice_text if is_voice else None
+            display_text = voice_text if is_voice else text if text else "[图片]"
+            await self._enqueue_message(
+                user_id,
+                event,
+                text,
+                source_type=source_type,
+                delay_text=delay_text,
+                wait_trigger=True,
+                image_only=is_image_only,
+            )
+            self._cancel_timer(user_id)
+            self.infinite_wait[user_id] = False
+            wait_sec = self._get_config("wait_keyword_seconds", 300)
+            trigger = "语音" if is_voice else "图片" if is_image_only else "关键词"
+            if wait_sec == 0:
+                self.infinite_wait[user_id] = True
+                self.wait_start_time[user_id] = time.time()
+                self._log(
+                    f'[{user_id}] 触发无限等待({trigger}): "{display_text[:30]}" | 队列: {queue_len + 1}条'
+                )
+            else:
+                random_range = self._get_config("wait_keyword_random_range", 0)
+                if random_range > 0:
+                    wait_sec = max(
+                        1, wait_sec + random.randint(-random_range, random_range)
+                    )
+                self.wait_start_time[user_id] = time.time()
+                self._log(
+                    f'[{user_id}] 触发等待({trigger}): "{display_text[:30]}" | 等待: {wait_sec}秒 | 队列: {queue_len + 1}条'
+                )
+                self._start_timer(user_id, event, wait_sec)
+            return
+
+        # Any non-wait message exits a previous infinite wait before normal routing.
+        self.infinite_wait[user_id] = False
+
+        # Skip keyword (new text only): flush the queue immediately or after jitter.
+        if not is_voice and text and self._check_skip_words(text):
             event.stop_event()
             await self._enqueue_message(user_id, event, text)
             self._cancel_timer(user_id)
@@ -575,48 +806,22 @@ class ChatMergerPlugin(Star):
                 await self._send_merged(user_id)
             return
 
-        # Wait keyword or image-only
-        is_wait = (text and self._check_wait_keywords(text)) or is_image_only
-        if is_wait:
-            event.stop_event()
-            display_text = text if text else "[图片]"
-            await self._enqueue_message(
-                user_id,
-                event,
-                text,
-                image_only=is_image_only,
-            )
-            wait_sec = self._get_config("wait_keyword_seconds", 300)
-            if wait_sec == 0:
-                self.infinite_wait[user_id] = True
-                self.wait_start_time[user_id] = time.time()
-                trigger = "图片" if is_image_only else "关键词"
-                self._log(
-                    f'[{user_id}] 触发无限等待({trigger}): "{display_text[:30]}" | 队列: {queue_len + 1}条'
-                )
-            else:
-                random_range = self._get_config("wait_keyword_random_range", 0)
-                if random_range > 0:
-                    wait_sec = max(
-                        1, wait_sec + random.randint(-random_range, random_range)
-                    )
-                self.wait_start_time[user_id] = time.time()
-                trigger = "图片" if is_image_only else "关键词"
-                self._log(
-                    f'[{user_id}] 触发等待({trigger}): "{display_text[:30]}" | 等待: {wait_sec}秒 | 队列: {queue_len + 1}条'
-                )
-                self._start_timer(user_id, event, wait_sec)
-            return
-
-        # Normal message: stop event, queue it
+        # Normal message: stop event, queue it.
         event.stop_event()
-        await self._enqueue_message(user_id, event, text)
+        await self._enqueue_message(
+            user_id,
+            event,
+            text,
+            source_type="voice" if is_voice else "text",
+            delay_text=voice_text if is_voice else text,
+        )
         if user_id not in self.wait_start_time:
             self.wait_start_time[user_id] = time.time()
 
         new_queue_len = len(self.message_queues[user_id])
 
-        # Check message count threshold
+        # A voice that triggered long wait returned above. Other messages use the
+        # regular count threshold, including voice when voice wait is disabled.
         max_count = self._get_config("max_message_count", 10)
         if new_queue_len >= max_count:
             self._log(
@@ -626,10 +831,10 @@ class ChatMergerPlugin(Star):
             await self._send_merged(user_id)
             return
 
-        # Determine delay
         delay = self._calc_queue_delay(user_id)
+        display_text = voice_text if is_voice else text
         self._log(
-            f'[{user_id}] 收到消息: "{text[:30]}" | 队列: {new_queue_len}条 | 等待: {delay:.0f}秒后发送'
+            f'[{user_id}] 收到消息: "{display_text[:30]}" | 队列: {new_queue_len}条 | 等待: {delay:.0f}秒后发送'
         )
         self._start_timer(user_id, event, delay)
 
@@ -653,9 +858,9 @@ class ChatMergerPlugin(Star):
         user_id = event.get_sender_id()
         q = len(self.message_queues[user_id])
         w = sum(
-            count_words(item["text"])
+            count_words(item.get("delay_text", item["text"]))
             for item in self.message_queues[user_id]
-            if item["text"]
+            if item.get("delay_text", item["text"])
         )
         inf = "是" if self.infinite_wait.get(user_id, False) else "否"
         elapsed = ""
@@ -710,6 +915,11 @@ class ChatMergerPlugin(Star):
             f"输入状态显示: {self._get_config('typing_status_enabled', True)}",
             f"输入状态间隔: {self._get_config('typing_interval', 0.5)}秒",
             f"图片触发超长等待: {self._get_config('image_wait_enabled', True)}",
+            f"语音消息感知: {self._get_config('voice_message_enabled', True)}",
+            f"语音触发超长等待: {self._get_config('voice_wait_enabled', True)}",
+            f"首选 STT: {self._get_config('stt_provider_id', '') or '未配置'}",
+            f"一级 STT 兜底: {self._get_config('stt_fallback_provider_id', '') or '未配置'}",
+            f"二级 STT 兜底: {self._get_config('stt_fallback_provider_id_2', '') or '未配置'}",
             f"等待随机变化: ±{self._get_config('wait_keyword_random_range', 0)}秒",
         ]
         yield event.plain_result("[消息合并] 当前配置:\n" + "\n".join(lines))
