@@ -237,6 +237,60 @@ class _FakeImage:
 
 
 class ChatMergerImageCaptionTests(unittest.IsolatedAsyncioTestCase):
+    def test_ordered_fallback_config_prefers_new_list_and_supports_legacy(self):
+        plugin = ChatMergerVideoTests._plugin()
+        plugin.config = {
+            "图片消息": {
+                "image_caption_fallback_provider_ids": ["second", "third"],
+                "image_caption_fallback_provider_id": "legacy-one",
+                "image_caption_fallback_provider_id_2": "legacy-two",
+            }
+        }
+        self.assertEqual(
+            plugin._configured_fallback_ids(
+                "image_caption_fallback_provider_ids",
+                (
+                    "image_caption_fallback_provider_id",
+                    "image_caption_fallback_provider_id_2",
+                ),
+            ),
+            ["second", "third"],
+        )
+
+        plugin.config = {
+            "图片消息": {
+                "image_caption_fallback_provider_ids": [],
+                "image_caption_fallback_provider_id": "legacy-one",
+            }
+        }
+        self.assertEqual(
+            plugin._configured_fallback_ids(
+                "image_caption_fallback_provider_ids",
+                (
+                    "image_caption_fallback_provider_id",
+                    "image_caption_fallback_provider_id_2",
+                ),
+            ),
+            [],
+        )
+
+        plugin.config = {
+            "图片消息": {
+                "image_caption_fallback_provider_id": "legacy-one",
+                "image_caption_fallback_provider_id_2": "legacy-two",
+            }
+        }
+        self.assertEqual(
+            plugin._configured_fallback_ids(
+                "image_caption_fallback_provider_ids",
+                (
+                    "image_caption_fallback_provider_id",
+                    "image_caption_fallback_provider_id_2",
+                ),
+            ),
+            ["legacy-one", "legacy-two"],
+        )
+
     def test_caption_parser_and_refusal_detection(self) -> None:
         self.assertEqual(
             parse_caption_map('{"图1":"第一张","图2":"第二张"}', ["图1", "图2"]),

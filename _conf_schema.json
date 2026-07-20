@@ -150,19 +150,15 @@
                 "default": "",
                 "_special": "select_provider_stt"
             },
-            "stt_fallback_provider_id": {
-                "description": "一级 STT 兜底模型",
-                "hint": "首选模型未配置或识别失败时尝试",
-                "type": "string",
-                "default": "",
-                "_special": "select_provider_stt"
-            },
-            "stt_fallback_provider_id_2": {
-                "description": "二级 STT 兜底模型",
-                "hint": "一级兜底仍失败时最后尝试；不会自动使用当前会话 STT",
-                "type": "string",
-                "default": "",
-                "_special": "select_provider_stt"
+            "stt_fallback_provider_ids": {
+                "description": "STT 回退模型列表",
+                "hint": "首选模型未配置、识别失败或返回空内容时，按列表顺序逐个尝试。可添加任意数量并上下调整顺序",
+                "type": "list",
+                "items": {
+                    "type": "string"
+                },
+                "default": [],
+                "_special": "select_providers_stt"
             },
             "stt_file_ready_retries": {
                 "description": "语音文件就绪重试次数",
@@ -195,19 +191,15 @@
                 "default": "",
                 "_special": "select_provider"
             },
-            "image_caption_fallback_provider_id": {
-                "description": "一级图片转述兜底模型",
-                "hint": "首选模型异常、返回空内容或拒绝内容时尝试",
-                "type": "string",
-                "default": "",
-                "_special": "select_provider"
-            },
-            "image_caption_fallback_provider_id_2": {
-                "description": "二级图片转述兜底模型",
-                "hint": "一级兜底仍失败时最后尝试",
-                "type": "string",
-                "default": "",
-                "_special": "select_provider"
+            "image_caption_fallback_provider_ids": {
+                "description": "图片转述回退模型列表",
+                "hint": "首选模型异常、返回空内容或拒绝内容时，按列表顺序逐个尝试。可添加任意数量并上下调整顺序",
+                "type": "list",
+                "items": {
+                    "type": "string"
+                },
+                "default": [],
+                "_special": "select_providers"
             },
             "image_caption_prompt": {
                 "description": "图片转述提示词",

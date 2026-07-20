@@ -140,43 +140,62 @@ class ChatMergerPlugin(Star):
             "</voice_message>"
         )
 
+    def _find_config_value(self, key: str):
+        if key in self.config:
+            return True, self.config[key]
+        for group_key in self.config:
+            group = self.config.get(group_key)
+            if isinstance(group, dict) and key in group:
+                return True, group[key]
+        return False, None
+
+    def _configured_fallback_ids(
+        self, list_key: str, legacy_keys: tuple[str, ...]
+    ) -> list[str]:
+        exists, configured = self._find_config_value(list_key)
+        if exists:
+            if isinstance(configured, list):
+                return [str(item).strip() for item in configured if str(item).strip()]
+            self._log(f"回退 Provider 配置不是列表: {list_key}")
+            return []
+        return [
+            value
+            for key in legacy_keys
+            if (value := str(self._get_config(key, "") or "").strip())
+        ]
+
     def _stt_providers(self) -> list[STTProvider]:
-        providers = []
-        seen = set()
-        config_keys = (
-            "stt_provider_id",
-            "stt_fallback_provider_id",
-            "stt_fallback_provider_id_2",
-        )
-        for key in config_keys:
-            provider_id = str(self._get_config(key, "") or "").strip()
-            if not provider_id:
-                continue
-            provider = self.context.get_provider_by_id(provider_id)
-            if not isinstance(provider, STTProvider):
-                self._log(f"STT Provider 不可用或类型不正确: {provider_id}")
-                continue
-            identity = id(provider)
-            if identity in seen:
-                continue
-            seen.add(identity)
-            providers.append(provider)
-        return providers
+        provider_ids = [
+            str(self._get_config("stt_provider_id", "") or "").strip(),
+            *self._configured_fallback_ids(
+                "stt_fallback_provider_ids",
+                ("stt_fallback_provider_id", "stt_fallback_provider_id_2"),
+            ),
+        ]
+        return self._resolve_providers(provider_ids, STTProvider, "STT")
 
     def _image_providers(self) -> list[Provider]:
+        provider_ids = [
+            str(self._get_config("image_caption_provider_id", "") or "").strip(),
+            *self._configured_fallback_ids(
+                "image_caption_fallback_provider_ids",
+                (
+                    "image_caption_fallback_provider_id",
+                    "image_caption_fallback_provider_id_2",
+                ),
+            ),
+        ]
+        return self._resolve_providers(provider_ids, Provider, "图片转述")
+
+    def _resolve_providers(self, provider_ids, provider_type, label):
         providers = []
         seen = set()
-        for key in (
-            "image_caption_provider_id",
-            "image_caption_fallback_provider_id",
-            "image_caption_fallback_provider_id_2",
-        ):
-            provider_id = str(self._get_config(key, "") or "").strip()
+        for provider_id in provider_ids:
             if not provider_id:
                 continue
             provider = self.context.get_provider_by_id(provider_id)
-            if not isinstance(provider, Provider):
-                self._log(f"图片转述 Provider 不可用或类型不正确: {provider_id}")
+            if not isinstance(provider, provider_type):
+                self._log(f"{label} Provider 不可用或类型不正确: {provider_id}")
                 continue
             identity = id(provider)
             if identity in seen:
@@ -1216,13 +1235,11 @@ class ChatMergerPlugin(Star):
             f"插件级图片转述: {self._get_config('image_caption_enabled', False)}",
             f"图片上下文完整保留: {self._get_config('max_image_context_details', 3)}张 (0=不限制)",
             f"首选图片转述模型: {self._get_config('image_caption_provider_id', '') or '未配置'}",
-            f"一级图片转述兜底: {self._get_config('image_caption_fallback_provider_id', '') or '未配置'}",
-            f"二级图片转述兜底: {self._get_config('image_caption_fallback_provider_id_2', '') or '未配置'}",
+            f"图片转述回退列表: {self._configured_fallback_ids('image_caption_fallback_provider_ids', ('image_caption_fallback_provider_id', 'image_caption_fallback_provider_id_2')) or '未配置'}",
             f"语音消息感知: {self._get_config('voice_message_enabled', True)}",
             f"语音触发超长等待: {self._get_config('voice_wait_enabled', True)}",
             f"首选 STT: {self._get_config('stt_provider_id', '') or '未配置'}",
-            f"一级 STT 兜底: {self._get_config('stt_fallback_provider_id', '') or '未配置'}",
-            f"二级 STT 兜底: {self._get_config('stt_fallback_provider_id_2', '') or '未配置'}",
+            f"STT 回退列表: {self._configured_fallback_ids('stt_fallback_provider_ids', ('stt_fallback_provider_id', 'stt_fallback_provider_id_2')) or '未配置'}",
             f"等待随机变化: ±{self._get_config('wait_keyword_random_range', 0)}秒",
         ]
         yield event.plain_result("[消息合并] 当前配置:\n" + "\n".join(lines))
