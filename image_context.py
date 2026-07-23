@@ -4,6 +4,9 @@ import re
 from typing import Any
 
 IMAGE_CONTEXT_START = "<!-- astrbot-chat-merger:image-context:v1:start -->"
+IMAGE_CONTEXT_RETAINED_START = (
+    "<!-- astrbot-chat-merger:image-context:v1:retained:start -->"
+)
 IMAGE_CONTEXT_END = "<!-- astrbot-chat-merger:image-context:v1:end -->"
 IMAGE_CONTEXT_PRUNED = "[历史图片：详细解析内容已按上下文保留限制清理]"
 IMAGE_CONTEXT_PATTERN = re.compile(
@@ -12,10 +15,11 @@ IMAGE_CONTEXT_PATTERN = re.compile(
 )
 
 
-def wrap_image_context(details: str) -> str:
+def wrap_image_context(details: str, *, retained: bool = False) -> str:
+    start = IMAGE_CONTEXT_RETAINED_START if retained else IMAGE_CONTEXT_START
     return "\n".join(
         (
-            IMAGE_CONTEXT_START,
+            start,
             details.strip(),
             IMAGE_CONTEXT_END,
         )

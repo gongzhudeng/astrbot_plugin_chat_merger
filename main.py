@@ -1,5 +1,6 @@
 import asyncio
 import html
+import importlib
 import random
 import re
 import time
@@ -407,17 +408,59 @@ class ChatMergerPlugin(Star):
                 video_index += 1
                 part["id"] = f"视频{video_index}"
 
+    @staticmethod
+    def _emoji_library_service():
+        try:
+            module = importlib.import_module(
+                "data.plugins.astrbot_plugin_emoji_library.service"
+            )
+            return module.get_service()
+        except (ImportError, AttributeError):
+            return None
+
     async def _caption_images(self, parts: list[dict]) -> dict[str, str]:
-        if not any(part["kind"] == "image" for part in parts):
+        image_parts = [part for part in parts if part["kind"] == "image"]
+        if not image_parts:
             return {}
         if not self._get_config("image_caption_enabled", False):
             return {}
+
+        captions: dict[str, str] = {}
+        unresolved: list[dict] = []
+        service = self._emoji_library_service()
+        for part in image_parts:
+            match = None
+            if service is not None:
+                try:
+                    match = await service.resolve_component(part["component"])
+                except Exception as e:
+                    self._debug(f"表情包解释库查询失败，回退图片转述: {e}")
+            explanation = str((match or {}).get("explanation", "")).strip()
+            if explanation:
+                image_id = str(part["id"])
+                captions[image_id] = explanation
+                part["preserve_image_context"] = bool(
+                    (match or {}).get("preserve_context", False)
+                )
+                self._log(f"{image_id} 命中表情包解释库，跳过图片模型")
+            else:
+                unresolved.append(part)
+
+        if not unresolved:
+            return captions
         providers = self._image_providers()
         if not providers:
             self._log("未配置可用的图片转述模型，图片将以失败占位交给主模型")
-            return {}
-        return await caption_ordered_images(
-            parts,
+            return captions
+
+        unresolved_ids = {id(part) for part in unresolved}
+        caption_parts = [
+            part
+            for part in parts
+            if part["kind"] != "image" or id(part) in unresolved_ids
+        ]
+        generated = await caption_ordered_images(
+            caption_parts,
             providers=providers,
             prompt=str(
                 self._get_config("image_caption_prompt", DEFAULT_IMAGE_CAPTION_PROMPT)
@@ -431,6 +474,20 @@ class ChatMergerPlugin(Star):
                 1, int(self._get_config("image_caption_max_images", 9) or 9)
             ),
         )
+        captions.update(generated)
+
+        if service is not None:
+            for part in unresolved:
+                explanation = generated.get(str(part["id"]), "").strip()
+                if not explanation:
+                    continue
+                try:
+                    await service.record_component_analysis(
+                        part["component"], explanation
+                    )
+                except Exception as e:
+                    self._debug(f"表情包解释候选保存失败: {e}")
+        return captions
 
     @staticmethod
     def _render_parts(
@@ -459,7 +516,8 @@ class ChatMergerPlugin(Star):
                 if description:
                     value = wrap_image_context(
                         f'<image_context id="{image_id}">{html.escape(description)}'
-                        "</image_context>"
+                        "</image_context>",
+                        retained=bool(part.get("preserve_image_context", False)),
                     )
                 else:
                     value = (
