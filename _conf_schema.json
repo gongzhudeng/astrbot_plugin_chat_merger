@@ -119,6 +119,12 @@
                 "type": "bool",
                 "default": true
             },
+            "matched_emoji_skip_wait": {
+                "description": "命中表情包时跳过等待",
+                "hint": "开启后，单独发送的图片命中已启用表情包解释库时，立即发送当前合并队列",
+                "type": "bool",
+                "default": false
+            },
             "voice_wait_enabled": {
                 "description": "语音触发超长等待",
                 "hint": "开启后，当前收到的语音消息会直接触发超长等待，不受转写字数和消息条数阈值影响；后续普通文字会恢复普通延迟规则",

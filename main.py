@@ -422,15 +422,22 @@ class ChatMergerPlugin(Star):
         image_parts = [part for part in parts if part["kind"] == "image"]
         if not image_parts:
             return {}
-        if not self._get_config("image_caption_enabled", False):
+        has_cached_match = any(
+            str((part.get("emoji_library_match") or {}).get("explanation", "")).strip()
+            for part in image_parts
+        )
+        if (
+            not self._get_config("image_caption_enabled", False)
+            and not has_cached_match
+        ):
             return {}
 
         captions: dict[str, str] = {}
         unresolved: list[dict] = []
         service = self._emoji_library_service()
         for part in image_parts:
-            match = None
-            if service is not None:
+            match = part.get("emoji_library_match")
+            if not part.get("emoji_library_checked") and service is not None:
                 try:
                     match = await service.resolve_component(part["component"])
                 except Exception as e:
@@ -446,7 +453,7 @@ class ChatMergerPlugin(Star):
             else:
                 unresolved.append(part)
 
-        if not unresolved:
+        if not unresolved or not self._get_config("image_caption_enabled", False):
             return captions
         providers = self._image_providers()
         if not providers:
@@ -507,12 +514,12 @@ class ChatMergerPlugin(Star):
                     replay_components.append(Plain(value))
             elif kind == "image":
                 image_id = str(part["id"])
-                if preserve_images:
+                description = image_captions.get(image_id, "").strip()
+                if preserve_images and not description:
                     placeholder = f"[{image_id}]"
                     text_lines.append(placeholder)
                     replay_components.extend([Plain(placeholder), part["component"]])
                     continue
-                description = image_captions.get(image_id, "").strip()
                 if description:
                     value = wrap_image_context(
                         f'<image_context id="{image_id}">{html.escape(description)}'
@@ -656,9 +663,31 @@ class ChatMergerPlugin(Star):
             image_only=image_only,
             video_only=video_only,
         )
+        item["emoji_library_matched"] = await self._prepare_emoji_library_matches(item)
         self.message_queues[user_id].append(item)
         self._event_refs[user_id] = event
         return item
+
+    async def _prepare_emoji_library_matches(self, item: dict) -> bool:
+        if not self._get_config("matched_emoji_skip_wait", False):
+            return False
+        service = self._emoji_library_service()
+        if service is None:
+            return False
+        matched = False
+        for part in item.get("parts", []):
+            if part.get("kind") != "image":
+                continue
+            try:
+                result = await service.resolve_component(part["component"])
+            except Exception as exc:
+                self._debug(f"表情包解释库提前查询失败: {exc}")
+                continue
+            part["emoji_library_checked"] = True
+            part["emoji_library_match"] = result
+            if str((result or {}).get("explanation", "")).strip():
+                matched = True
+        return matched
 
     # ── Typing state (NapCat input status) ───────────────────
 
@@ -1111,7 +1140,7 @@ class ChatMergerPlugin(Star):
                 if is_video_only
                 else "[图片]"
             )
-            await self._enqueue_message(
+            item = await self._enqueue_message(
                 user_id,
                 event,
                 text,
@@ -1123,6 +1152,10 @@ class ChatMergerPlugin(Star):
             )
             self._cancel_timer(user_id)
             self.infinite_wait[user_id] = False
+            if item.get("emoji_library_matched", False):
+                self._log(f"[{user_id}] 命中表情包解释库，跳过等待并立即发送当前队列")
+                await self._send_merged(user_id)
+                return
             wait_sec = self._get_config("wait_keyword_seconds", 300)
             trigger = (
                 "语音"
@@ -1181,7 +1214,7 @@ class ChatMergerPlugin(Star):
 
         # Normal message: stop event, queue it.
         event.stop_event()
-        await self._enqueue_message(
+        item = await self._enqueue_message(
             user_id,
             event,
             text,
@@ -1189,6 +1222,11 @@ class ChatMergerPlugin(Star):
             delay_text=voice_text if is_voice else text,
             video_only=is_video_only,
         )
+        if item.get("emoji_library_matched", False):
+            self._cancel_timer(user_id)
+            self._log(f"[{user_id}] 命中表情包解释库，跳过普通延迟并立即发送当前队列")
+            await self._send_merged(user_id)
+            return
         if user_id not in self.wait_start_time:
             self.wait_start_time[user_id] = time.time()
 

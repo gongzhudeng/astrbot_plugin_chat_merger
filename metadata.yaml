@@ -4,6 +4,6 @@ desc: >
   让AI聊天告别一问一答！自动合并连续消息 + "正在输入"状态，打造真人级对话体验。
   支持智能延迟计算、跳过关键词、超长等待、AI忙感知排队、图片独立转述和图片上下文限额等功能。
   v2.6.0：图片转述与 STT 支持可排序、数量不限的模型回退列表。
-version: 2.7.0
+version: 2.7.1
 author: 灵犀
 repo: https://github.com/gongzhudeng/astrbot_plugin_chat_merger

@@ -356,6 +356,83 @@ class ChatMergerImageCaptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(merged.endswith("\n你看这个"))
         self.assertNotIn(image, components)
 
+    async def test_early_library_match_is_cached_and_reused(self) -> None:
+        plugin = ChatMergerVideoTests._plugin()
+        plugin.config.update(
+            {
+                "matched_emoji_skip_wait": True,
+                "image_caption_enabled": True,
+            }
+        )
+        image = Image(file="D:/cache/image.jpg")
+        item = {"parts": [{"kind": "image", "id": "图1", "component": image}]}
+        service = type(
+            "EmojiService",
+            (),
+            {"resolve_component": AsyncMock(return_value={"explanation": "固定解释"})},
+        )()
+
+        with patch.object(plugin, "_emoji_library_service", return_value=service):
+            matched = await plugin._prepare_emoji_library_matches(item)
+            captions = await plugin._caption_images(item["parts"])
+
+        self.assertTrue(matched)
+        self.assertEqual(captions, {"图1": "固定解释"})
+        service.resolve_component.assert_awaited_once_with(image)
+
+    async def test_cached_match_renders_when_general_caption_is_disabled(self) -> None:
+        plugin = ChatMergerVideoTests._plugin()
+        plugin.config.update(
+            {
+                "matched_emoji_skip_wait": True,
+                "image_caption_enabled": False,
+            }
+        )
+        image = Image(file="D:/cache/image.jpg")
+        parts = [
+            {
+                "kind": "image",
+                "id": "图1",
+                "component": image,
+                "emoji_library_checked": True,
+                "emoji_library_match": {"explanation": "固定解释"},
+            }
+        ]
+
+        captions = await plugin._caption_images(parts)
+        merged, components = plugin._render_parts(
+            parts,
+            captions,
+            preserve_images=True,
+        )
+
+        self.assertEqual(captions, {"图1": "固定解释"})
+        self.assertIn("固定解释", merged)
+        self.assertNotIn(image, components)
+
+    async def test_disabled_skip_wait_does_not_query_library_early(self) -> None:
+        plugin = ChatMergerVideoTests._plugin()
+        plugin.config["matched_emoji_skip_wait"] = False
+        service = type(
+            "EmojiService",
+            (),
+            {"resolve_component": AsyncMock(return_value={"explanation": "固定解释"})},
+        )()
+        item = {
+            "parts": [
+                {
+                    "kind": "image",
+                    "component": Image(file="D:/cache/image.jpg"),
+                }
+            ]
+        }
+
+        with patch.object(plugin, "_emoji_library_service", return_value=service):
+            matched = await plugin._prepare_emoji_library_matches(item)
+
+        self.assertFalse(matched)
+        service.resolve_component.assert_not_awaited()
+
 
 class ImageContextLimitTests(unittest.IsolatedAsyncioTestCase):
     def test_many_image_contexts_keep_only_latest_details(self) -> None:
