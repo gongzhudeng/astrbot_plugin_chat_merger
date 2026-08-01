@@ -296,6 +296,17 @@ class ChatMergerImageCaptionTests(unittest.IsolatedAsyncioTestCase):
             parse_caption_map('{"图1":"第一张","图2":"第二张"}', ["图1", "图2"]),
             {"图1": "第一张", "图2": "第二张"},
         )
+        self.assertEqual(
+            parse_caption_map('{"图1": "第一张", "图2": "第二张"}', ["图1", "图2"]),
+            {"图1": "第一张", "图2": "第二张"},
+        )
+        self.assertEqual(
+            parse_caption_map(
+                '{"图1": "设备形似"眼睛"造型，品牌为"JISSBON"。"}',
+                ["图1"],
+            ),
+            {"图1": '设备形似"眼睛"造型，品牌为"JISSBON"。'},
+        )
         self.assertTrue(is_refusal_text("抱歉，我不能描述这张图", ["我不能描述"]))
 
     async def test_refusal_uses_fallback_and_keeps_ordered_context(self) -> None:
@@ -321,6 +332,31 @@ class ChatMergerImageCaptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"图1": "一个水池"})
         self.assertEqual(primary.calls, 1)
         self.assertEqual(fallback.calls, 1)
+
+    async def test_failed_image_preparation_does_not_require_missing_mapping(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            valid_path = Path(temp_dir) / "valid.jpg"
+            valid_path.write_bytes(b"jpeg")
+            missing_path = Path(temp_dir) / "missing.jpg"
+            provider = _FakeVisionProvider("primary", '{"图2":"有效图片"}')
+            parts = [
+                {"kind": "image", "id": "图1", "component": _FakeImage(missing_path)},
+                {"kind": "image", "id": "图2", "component": _FakeImage(valid_path)},
+            ]
+
+            result = await caption_ordered_images(
+                parts,
+                providers=[provider],
+                prompt="转述图片",
+                refusal_keywords=[],
+                timeout_seconds=5,
+                max_images=9,
+            )
+
+        self.assertEqual(result, {"图2": "有效图片"})
+        self.assertEqual(provider.calls, 1)
 
     async def test_disabled_caption_preserves_original_image(self) -> None:
         plugin = ChatMergerVideoTests._plugin()

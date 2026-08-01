@@ -13,11 +13,14 @@ from astrbot.api import logger
 DEFAULT_IMAGE_CAPTION_PROMPT = (
     "请结合图片在消息中的出现顺序和相邻文字，分别客观转述每张图片。"
     "识别人物、动作、场景、可读文字和与用户问题有关的信息，不要编造。"
+    "输出时严格遵守后面的 JSON 格式要求，不要输出额外解释。"
 )
 
 OUTPUT_PROTOCOL = (
-    "只输出一个 JSON 对象，键必须是给出的图片编号，值是对应图片的中文转述。"
-    '例如：{"图1": "...", "图2": "..."}。不要遗漏或修改编号。'
+    "只输出一个合法 JSON 对象，不要使用 Markdown 代码块或输出额外文字。"
+    "键必须完全使用给出的图片编号，且每个编号都必须出现一次。"
+    '例如：{"图1": "...", "图2": "..."}。不要遗漏、改写或合并编号。'
+    "描述中的英文双引号必须使用反斜杠转义。"
 )
 
 
@@ -38,25 +41,42 @@ def parse_caption_map(text: str, image_ids: list[str]) -> dict[str, str]:
     except json.JSONDecodeError:
         payload = None
     if isinstance(payload, dict):
-        result = {
+        return {
             image_id: str(payload.get(image_id, "") or "").strip()
             for image_id in image_ids
         }
-        if any(result.values()):
-            return result
 
     result: dict[str, str] = {}
     for image_id in image_ids:
         pattern = re.compile(
             rf"(?:<image_context\s+id=[\"']{re.escape(image_id)}[\"']>|"
-            rf"{re.escape(image_id)}\s*[:：])\s*(.*?)"
-            rf"(?:</image_context>|(?=\n\s*图\d+\s*[:：])|\Z)",
+            rf"[\"']?{re.escape(image_id)}[\"']?\s*[:：])\s*(.*?)"
+            rf"(?:</image_context>|(?=\s*,?\s*[\"']?(?:"
+            rf"{'|'.join(re.escape(value) for value in image_ids)}"
+            rf")[\"']?\s*[:：])|\Z)",
             flags=re.DOTALL | re.IGNORECASE,
         )
         match = pattern.search(clean)
         if match:
-            result[image_id] = " ".join(match.group(1).split()).strip()
+            value = match.group(1)
+            if "<image_context" not in match.group(0).lower():
+                value = _clean_lenient_json_value(value)
+            else:
+                value = " ".join(value.split()).strip()
+            if value:
+                result[image_id] = value
     return result
+
+
+def _clean_lenient_json_value(value: str) -> str:
+    value = value.strip().rstrip(",").strip()
+    if value.endswith("}"):
+        value = value[:-1].rstrip()
+    if value[:1] in {'"', "'"}:
+        value = value[1:]
+    if value[-1:] in {'"', "'"}:
+        value = value[:-1]
+    return value.strip()
 
 
 async def caption_ordered_images(
@@ -75,6 +95,7 @@ async def caption_ordered_images(
         return {}
 
     selected_ids = set(image_ids)
+    prepared_image_ids: list[str] = []
     content: list[dict[str, Any]] = [
         {
             "type": "text",
@@ -102,6 +123,7 @@ async def caption_ordered_images(
                     exc,
                 )
                 continue
+            prepared_image_ids.append(image_id)
             content.extend(
                 [
                     {"type": "text", "text": f"图片编号：{image_id}"},
@@ -114,6 +136,9 @@ async def caption_ordered_images(
                     },
                 ]
             )
+
+    if not prepared_image_ids:
+        return {}
 
     for provider in providers:
         provider_name = _provider_name(provider)
@@ -129,12 +154,16 @@ async def caption_ordered_images(
             if is_refusal_text(text, refusal_keywords):
                 logger.warning("[消息合并] 图片转述模型 %s 返回拒绝内容", provider_name)
                 continue
-            parsed = parse_caption_map(text, image_ids)
-            if all(parsed.get(image_id) for image_id in image_ids):
+            parsed = parse_caption_map(text, prepared_image_ids)
+            if all(parsed.get(image_id) for image_id in prepared_image_ids):
                 return parsed
+            missing_ids = [
+                image_id for image_id in prepared_image_ids if not parsed.get(image_id)
+            ]
             logger.warning(
-                "[消息合并] 图片转述模型 %s 未返回完整编号映射，尝试下一个",
+                "[消息合并] 图片转述模型 %s 未返回完整编号映射，缺少: %s，尝试下一个",
                 provider_name,
+                ", ".join(missing_ids) or "未知",
             )
         except Exception as exc:
             logger.warning(
