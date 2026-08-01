@@ -13,15 +13,15 @@ from astrbot.api import logger
 DEFAULT_IMAGE_CAPTION_PROMPT = (
     "请结合图片在消息中的出现顺序和相邻文字，分别客观转述每张图片。"
     "识别人物、动作、场景、可读文字和与用户问题有关的信息，不要编造。"
-    "输出时严格遵守后面的 JSON 格式要求，不要输出额外解释。"
 )
 
 OUTPUT_PROTOCOL = (
-    "只输出一个合法 JSON 对象，不要使用 Markdown 代码块或输出额外文字。"
-    "键必须完全使用给出的图片编号，且每个编号都必须出现一次。"
-    '例如：{"图1": "...", "图2": "..."}。不要遗漏、改写或合并编号。'
-    "描述中的英文双引号必须使用反斜杠转义。"
+    "请保留给出的图片编号，分别说明每张图片。"
+    '推荐输出为 {"图1": "...", "图2": "..."}，也可以使用“图1：……”等明确的编号格式。'
+    "不要遗漏、改写或合并编号；只有一张图片时可以直接输出描述。"
 )
+
+_CHINESE_NUMERALS = ("零", "一", "二", "三", "四", "五", "六", "七", "八", "九")
 
 
 def is_refusal_text(text: str, keywords: list[str]) -> bool:
@@ -44,31 +44,64 @@ def parse_caption_map(text: str, image_ids: list[str]) -> dict[str, str]:
         return {
             image_id: str(payload.get(image_id, "") or "").strip()
             for image_id in image_ids
+            if str(payload.get(image_id, "") or "").strip()
         }
 
+    result = _parse_numbered_captions(clean, image_ids)
+    if result or len(image_ids) != 1:
+        return result
+    plain = _clean_lenient_value(clean)
+    return {image_ids[0]: plain} if plain else {}
+
+
+def _parse_numbered_captions(text: str, image_ids: list[str]) -> dict[str, str]:
+    aliases = {image_id: _image_id_aliases(image_id) for image_id in image_ids}
+    alias_to_id = {
+        alias.lower(): image_id
+        for image_id, image_aliases in aliases.items()
+        for alias in image_aliases
+    }
+    marker_pattern = re.compile(
+        rf"(?:<image_context\s+id=[\"'](?P<xml>{'|'.join(map(re.escape, image_ids))})[\"']>|"
+        rf"[\"']?(?P<label>{'|'.join(map(re.escape, alias_to_id))})[\"']?"
+        rf"\s*(?:[:：]|(?:是|为|内容是|内容为)\s*))",
+        flags=re.IGNORECASE,
+    )
+    matches = list(marker_pattern.finditer(text))
     result: dict[str, str] = {}
-    for image_id in image_ids:
-        pattern = re.compile(
-            rf"(?:<image_context\s+id=[\"']{re.escape(image_id)}[\"']>|"
-            rf"[\"']?{re.escape(image_id)}[\"']?\s*[:：])\s*(.*?)"
-            rf"(?:</image_context>|(?=\s*,?\s*[\"']?(?:"
-            rf"{'|'.join(re.escape(value) for value in image_ids)}"
-            rf")[\"']?\s*[:：])|\Z)",
-            flags=re.DOTALL | re.IGNORECASE,
+    for index, match in enumerate(matches):
+        image_id = match.group("xml") or alias_to_id.get(
+            str(match.group("label") or "").lower()
         )
-        match = pattern.search(clean)
-        if match:
-            value = match.group(1)
-            if "<image_context" not in match.group(0).lower():
-                value = _clean_lenient_json_value(value)
-            else:
-                value = " ".join(value.split()).strip()
-            if value:
-                result[image_id] = value
+        if not image_id or image_id in result:
+            continue
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        value = text[match.end() : end]
+        if match.group("xml"):
+            value = value.split("</image_context>", 1)[0]
+        value = _clean_lenient_value(value)
+        if value:
+            result[image_id] = value
     return result
 
 
-def _clean_lenient_json_value(value: str) -> str:
+def _image_id_aliases(image_id: str) -> tuple[str, ...]:
+    matched = re.search(r"(\d+)$", image_id)
+    index = int(matched.group(1)) if matched else 0
+    chinese = (
+        _CHINESE_NUMERALS[index] if 0 < index < len(_CHINESE_NUMERALS) else str(index)
+    )
+    return (
+        image_id,
+        f"图片{index}",
+        f"图{chinese}",
+        f"图片{chinese}",
+        f"第{index}张",
+        f"第{chinese}张",
+    )
+
+
+def _clean_lenient_value(value: str) -> str:
     value = value.strip().rstrip(",").strip()
     if value.endswith("}"):
         value = value[:-1].rstrip()
@@ -76,7 +109,7 @@ def _clean_lenient_json_value(value: str) -> str:
         value = value[1:]
     if value[-1:] in {'"', "'"}:
         value = value[:-1]
-    return value.strip()
+    return " ".join(value.split()).strip()
 
 
 async def caption_ordered_images(
@@ -140,11 +173,16 @@ async def caption_ordered_images(
     if not prepared_image_ids:
         return {}
 
+    captions: dict[str, str] = {}
+    pending_ids = list(prepared_image_ids)
     for provider in providers:
         provider_name = _provider_name(provider)
+        provider_content = _content_for_image_ids(content, pending_ids)
         try:
             response = await asyncio.wait_for(
-                provider.text_chat(contexts=[{"role": "user", "content": content}]),
+                provider.text_chat(
+                    contexts=[{"role": "user", "content": provider_content}]
+                ),
                 timeout=max(1.0, timeout_seconds),
             )
             text = str(getattr(response, "completion_text", "") or "").strip()
@@ -154,16 +192,17 @@ async def caption_ordered_images(
             if is_refusal_text(text, refusal_keywords):
                 logger.warning("[消息合并] 图片转述模型 %s 返回拒绝内容", provider_name)
                 continue
-            parsed = parse_caption_map(text, prepared_image_ids)
-            if all(parsed.get(image_id) for image_id in prepared_image_ids):
-                return parsed
-            missing_ids = [
-                image_id for image_id in prepared_image_ids if not parsed.get(image_id)
+            parsed = parse_caption_map(text, pending_ids)
+            captions.update(parsed)
+            pending_ids = [
+                image_id for image_id in pending_ids if not captions.get(image_id)
             ]
+            if not pending_ids:
+                return captions
             logger.warning(
-                "[消息合并] 图片转述模型 %s 未返回完整编号映射，缺少: %s，尝试下一个",
+                "[消息合并] 图片转述模型 %s 缺少图片描述: %s，尝试下一个",
                 provider_name,
-                ", ".join(missing_ids) or "未知",
+                ", ".join(pending_ids),
             )
         except Exception as exc:
             logger.warning(
@@ -171,7 +210,27 @@ async def caption_ordered_images(
                 provider_name,
                 exc,
             )
-    return {}
+    return captions
+
+
+def _content_for_image_ids(
+    content: list[dict[str, Any]], image_ids: list[str]
+) -> list[dict[str, Any]]:
+    selected = set(image_ids)
+    result: list[dict[str, Any]] = []
+    for item in content:
+        if item.get("type") == "image_url":
+            if str(item.get("image_url", {}).get("id", "")) in selected:
+                result.append(item)
+            continue
+        text = str(item.get("text", ""))
+        if (
+            text.startswith("图片编号：")
+            and text.removeprefix("图片编号：") not in selected
+        ):
+            continue
+        result.append(item)
+    return result
 
 
 def _path_to_data_url(path: Path) -> str:

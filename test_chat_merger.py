@@ -217,12 +217,14 @@ class _FakeVisionProvider:
         self.provider_id = provider_id
         self.result = result
         self.calls = 0
+        self.requests = []
 
     def meta(self):
         return type("Meta", (), {"id": self.provider_id})()
 
     async def text_chat(self, **kwargs):
         self.calls += 1
+        self.requests.append(kwargs)
         if isinstance(self.result, Exception):
             raise self.result
         return _FakeVisionResponse(self.result)
@@ -307,6 +309,21 @@ class ChatMergerImageCaptionTests(unittest.IsolatedAsyncioTestCase):
             ),
             {"图1": '设备形似"眼睛"造型，品牌为"JISSBON"。'},
         )
+        self.assertEqual(
+            parse_caption_map("这是一个黑色电子玩具。", ["图1"]),
+            {"图1": "这是一个黑色电子玩具。"},
+        )
+        self.assertEqual(
+            parse_caption_map(
+                "图一是黑色电子玩具。\n第二张为白色包装盒。",
+                ["图1", "图2"],
+            ),
+            {"图1": "黑色电子玩具。", "图2": "白色包装盒。"},
+        )
+        self.assertEqual(
+            parse_caption_map("两张图都是电子玩具。", ["图1", "图2"]),
+            {},
+        )
         self.assertTrue(is_refusal_text("抱歉，我不能描述这张图", ["我不能描述"]))
 
     async def test_refusal_uses_fallback_and_keeps_ordered_context(self) -> None:
@@ -332,6 +349,37 @@ class ChatMergerImageCaptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"图1": "一个水池"})
         self.assertEqual(primary.calls, 1)
         self.assertEqual(fallback.calls, 1)
+
+    async def test_partial_mapping_only_retries_missing_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first_path = Path(temp_dir) / "first.jpg"
+            second_path = Path(temp_dir) / "second.jpg"
+            first_path.write_bytes(b"first")
+            second_path.write_bytes(b"second")
+            primary = _FakeVisionProvider("primary", "图一：黑色玩具")
+            fallback = _FakeVisionProvider("fallback", "白色包装盒")
+            parts = [
+                {"kind": "image", "id": "图1", "component": _FakeImage(first_path)},
+                {"kind": "image", "id": "图2", "component": _FakeImage(second_path)},
+            ]
+
+            result = await caption_ordered_images(
+                parts,
+                providers=[primary, fallback],
+                prompt="转述图片",
+                refusal_keywords=[],
+                timeout_seconds=5,
+                max_images=9,
+            )
+
+        self.assertEqual(result, {"图1": "黑色玩具", "图2": "白色包装盒"})
+        fallback_content = fallback.requests[0]["contexts"][0]["content"]
+        fallback_image_ids = [
+            item["image_url"]["id"]
+            for item in fallback_content
+            if item.get("type") == "image_url"
+        ]
+        self.assertEqual(fallback_image_ids, ["图2"])
 
     async def test_failed_image_preparation_does_not_require_missing_mapping(
         self,

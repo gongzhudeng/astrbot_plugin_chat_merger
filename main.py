@@ -56,7 +56,7 @@ MERGED_FLAG_KEY = "chat_merger_merged"
     "astrbot_plugin_chat_merger",
     "灵犀 · 消息合并助手",
     '彻底告别一问一答式AI聊天。自动合并连续消息、智能延迟后统一回复，AI思考时显示"对方正在输入…"。支持关键词触发超长等待、图片智能合并、等待时间随机波动、AI忙感知自动排队、LLM智能延迟判断、输入状态感知、撤回消息过滤，让AI对话真正拥有真人聊天的节奏感',
-    "2.7.2",
+    "2.7.3",
     "https://github.com/gongzhudeng/astrbot_plugin_chat_merger",
 )
 class ChatMergerPlugin(Star):
