@@ -3,11 +3,13 @@ from __future__ import annotations
 # ruff: noqa: E402, I001
 
 import asyncio
+import base64
+import io
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 ASTRBOT_DIR = Path(__file__).resolve().parents[3]
@@ -16,10 +18,12 @@ sys.path.insert(0, str(ASTRBOT_DIR))
 
 from astrbot.core.message.components import Image, Plain, Reply, Video
 from astrbot_plugin_chat_merger.image_caption import (
+    _path_to_data_url,
     caption_ordered_images,
     is_refusal_text,
     parse_caption_map,
 )
+from astrbot_plugin_chat_merger.image_preprocess import prepare_image_bytes
 from astrbot_plugin_chat_merger.image_context import (
     IMAGE_CONTEXT_PRUNED,
     count_image_contexts,
@@ -236,6 +240,111 @@ class _FakeImage:
 
     async def convert_to_file_path(self) -> str:
         return str(self.path)
+
+
+class ChatMergerImagePreprocessTests(unittest.TestCase):
+    @staticmethod
+    def _encode_image(
+        size: tuple[int, int],
+        *,
+        mode: str = "RGB",
+        color="white",
+        image_format: str = "PNG",
+    ) -> bytes:
+        from PIL import Image as PillowImage
+
+        image = PillowImage.new(mode, size, color)
+        output = io.BytesIO()
+        image.save(output, format=image_format)
+        return output.getvalue()
+
+    @staticmethod
+    def _decode_data_url(data_url: str) -> tuple[str, bytes]:
+        header, payload = data_url.split(",", 1)
+        return header, base64.b64decode(payload)
+
+    def test_disabled_preprocess_keeps_original_png_and_mime(self) -> None:
+        original = self._encode_image((320, 180))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "small.png"
+            path.write_bytes(original)
+
+            header, payload = self._decode_data_url(
+                _path_to_data_url(path, compress_enabled=False)
+            )
+
+        self.assertEqual(header, "data:image/png;base64")
+        self.assertEqual(payload, original)
+
+    def test_large_image_is_resized_without_upscaling(self) -> None:
+        from PIL import Image as PillowImage
+
+        large = self._encode_image((2400, 1200))
+        prepared = prepare_image_bytes(large, max_size=1280, quality=85)
+        with PillowImage.open(io.BytesIO(prepared)) as image:
+            self.assertEqual(image.size, (1280, 640))
+
+        small = self._encode_image((640, 320))
+        self.assertEqual(
+            prepare_image_bytes(small, max_size=1280, quality=85),
+            small,
+        )
+
+    def test_transparent_png_uses_white_jpeg_background_when_resized(self) -> None:
+        from PIL import Image as PillowImage
+
+        transparent = self._encode_image(
+            (1600, 800),
+            mode="RGBA",
+            color=(255, 0, 0, 0),
+        )
+        prepared = prepare_image_bytes(transparent, max_size=1280, quality=85)
+
+        self.assertTrue(prepared.startswith(b"\xff\xd8\xff"))
+        with PillowImage.open(io.BytesIO(prepared)) as image:
+            pixel = image.convert("RGB").getpixel((0, 0))
+        self.assertTrue(all(channel >= 245 for channel in pixel))
+
+    def test_large_file_keeps_original_when_reencoding_is_not_smaller(self) -> None:
+        original = b"x" * (1024 * 1024 + 1)
+        image = MagicMock()
+        image.size = (1280, 960)
+        image.mode = "RGB"
+        image.getbands.return_value = ("R", "G", "B")
+        source = MagicMock()
+        source.__enter__.return_value = image
+
+        def write_larger_result(target, **kwargs) -> None:
+            del kwargs
+            target.write(original + b"larger")
+
+        image.save.side_effect = write_larger_result
+        with (
+            patch(
+                "astrbot_plugin_chat_merger.image_preprocess.Image.open",
+                return_value=source,
+            ),
+            patch(
+                "astrbot_plugin_chat_merger.image_preprocess.ImageOps.exif_transpose",
+                return_value=image,
+            ),
+        ):
+            prepared = prepare_image_bytes(original, max_size=1280, quality=85)
+
+        self.assertEqual(prepared, original)
+
+    def test_small_webp_keeps_original_bytes_and_mime(self) -> None:
+        original = self._encode_image((320, 180), image_format="WEBP")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "small.webp"
+            path.write_bytes(original)
+
+            header, payload = self._decode_data_url(
+                _path_to_data_url(path, compress_enabled=True)
+            )
+
+        self.assertEqual(header, "data:image/webp;base64")
+        self.assertEqual(payload, original)
 
 
 class ChatMergerImageCaptionTests(unittest.IsolatedAsyncioTestCase):

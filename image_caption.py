@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import mimetypes
 import re
 from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
+
+from .image_preprocess import prepare_image_bytes
 
 DEFAULT_IMAGE_CAPTION_PROMPT = (
     "请结合图片在消息中的出现顺序和相邻文字，分别客观转述每张图片。"
@@ -120,6 +121,9 @@ async def caption_ordered_images(
     refusal_keywords: list[str],
     timeout_seconds: float,
     max_images: int,
+    compress_enabled: bool = False,
+    compress_max_size: int = 1280,
+    compress_quality: int = 85,
 ) -> dict[str, str]:
     image_parts = [part for part in ordered_parts if part.get("kind") == "image"]
     selected = image_parts[: max(1, max_images)]
@@ -148,7 +152,12 @@ async def caption_ordered_images(
             image_id = str(part["id"])
             try:
                 image_path = await part["component"].convert_to_file_path()
-                image_url = _path_to_data_url(Path(image_path))
+                image_url = _path_to_data_url(
+                    Path(image_path),
+                    compress_enabled=compress_enabled,
+                    compress_max_size=compress_max_size,
+                    compress_quality=compress_quality,
+                )
             except Exception as exc:
                 logger.warning(
                     "[消息合并] 图片 %s 准备失败，将使用失败占位: %s",
@@ -233,9 +242,45 @@ def _content_for_image_ids(
     return result
 
 
-def _path_to_data_url(path: Path) -> str:
-    data = path.read_bytes()
-    mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+def _image_mime(data: bytes) -> str:
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:2] == b"BM":
+        return "image/bmp"
+    return "image/jpeg"
+
+
+def _path_to_data_url(
+    path: Path,
+    *,
+    compress_enabled: bool = False,
+    compress_max_size: int = 1280,
+    compress_quality: int = 85,
+) -> str:
+    original = path.read_bytes()
+    data = (
+        prepare_image_bytes(
+            original,
+            max_size=compress_max_size,
+            quality=compress_quality,
+        )
+        if compress_enabled
+        else original
+    )
+    mime = _image_mime(data)
+    if compress_enabled and len(data) < len(original):
+        logger.info(
+            "[消息合并] 图片预处理完成: %s, %d KB -> %d KB",
+            path.name,
+            len(original) // 1024,
+            len(data) // 1024,
+        )
     payload = base64.b64encode(data).decode("ascii")
     return f"data:{mime};base64,{payload}"
 

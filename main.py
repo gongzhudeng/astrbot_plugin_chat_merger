@@ -56,7 +56,7 @@ MERGED_FLAG_KEY = "chat_merger_merged"
     "astrbot_plugin_chat_merger",
     "灵犀 · 消息合并助手",
     '彻底告别一问一答式AI聊天。自动合并连续消息、智能延迟后统一回复，AI思考时显示"对方正在输入…"。支持关键词触发超长等待、图片智能合并、等待时间随机波动、AI忙感知自动排队、LLM智能延迟判断、输入状态感知、撤回消息过滤，让AI对话真正拥有真人聊天的节奏感',
-    "2.7.3",
+    "2.8.0",
     "https://github.com/gongzhudeng/astrbot_plugin_chat_merger",
 )
 class ChatMergerPlugin(Star):
@@ -479,6 +479,20 @@ class ChatMergerPlugin(Star):
             ),
             max_images=max(
                 1, int(self._get_config("image_caption_max_images", 9) or 9)
+            ),
+            compress_enabled=bool(
+                self._get_config("image_caption_compress_enabled", False)
+            ),
+            compress_max_size=max(
+                1,
+                int(self._get_config("image_caption_compress_max_size", 1280) or 1280),
+            ),
+            compress_quality=min(
+                100,
+                max(
+                    50,
+                    int(self._get_config("image_caption_compress_quality", 85) or 85),
+                ),
             ),
         )
         captions.update(generated)
@@ -1329,6 +1343,9 @@ class ChatMergerPlugin(Star):
             f"图片触发超长等待: {self._get_config('image_wait_enabled', True)}",
             f"视频触发超长等待: {self._get_config('video_wait_enabled', True)}",
             f"插件级图片转述: {self._get_config('image_caption_enabled', False)}",
+            f"单轮图片预处理: {self._get_config('image_caption_compress_enabled', False)}",
+            f"图片预处理最长边: {self._get_config('image_caption_compress_max_size', 1280)}px",
+            f"图片预处理质量: {self._get_config('image_caption_compress_quality', 85)}",
             f"图片上下文完整保留: {self._get_config('max_image_context_details', 3)}张 (0=不限制)",
             f"首选图片转述模型: {self._get_config('image_caption_provider_id', '') or '未配置'}",
             f"图片转述回退列表: {self._configured_fallback_ids('image_caption_fallback_provider_ids', ('image_caption_fallback_provider_id', 'image_caption_fallback_provider_id_2')) or '未配置'}",

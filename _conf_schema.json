@@ -225,6 +225,34 @@
                 "type": "int",
                 "default": 9
             },
+            "image_caption_compress_enabled": {
+                "description": "启用图片预处理压缩",
+                "hint": "仅影响插件级图片转述请求，不修改原始图片。开启后会按最长边和 JPEG 质量生成较小的视觉输入；默认关闭。",
+                "type": "bool",
+                "default": false
+            },
+            "image_caption_compress_max_size": {
+                "description": "图片预处理最长边（像素）",
+                "hint": "图片超过此最长边时按比例缩小；未超过且文件小于 1 MB 时跳过处理。",
+                "type": "int",
+                "slider": {
+                    "min": 256,
+                    "max": 4096,
+                    "step": 64
+                },
+                "default": 1280
+            },
+            "image_caption_compress_quality": {
+                "description": "图片预处理 JPEG 质量",
+                "hint": "范围 50-100。文字、二维码或票据图片建议使用较高质量。",
+                "type": "int",
+                "slider": {
+                    "min": 50,
+                    "max": 100,
+                    "step": 5
+                },
+                "default": 85
+            },
             "max_image_context_details": {
                 "description": "最大保留完整图片上下文数量",
                 "hint": "超过数量后，仅把更旧的成功图片转述替换为轻量标记，用户原话和 AI 回复保持不变。0 表示不限制。",
