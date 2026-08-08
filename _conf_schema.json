@@ -217,7 +217,7 @@
                 "description": "图片模型拒绝判定关键词",
                 "hint": "首选模型返回内容命中任一关键词时视为拒绝，并自动尝试兜底模型",
                 "type": "list",
-                "default": ["无法协助", "不能协助", "无法描述", "不能描述", "抱歉，我不能", "i can't help", "i cannot help", "unable to assist"]
+                "default": ["无法协助", "不能协助", "无法描述", "不能描述", "抱歉，我不能", "i can't discuss", "i can't help", "i cannot help", "unable to assist"]
             },
             "image_caption_max_images": {
                 "description": "单轮最大图片转述数量",
