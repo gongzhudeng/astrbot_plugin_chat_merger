@@ -151,9 +151,8 @@ async def caption_ordered_images(
         elif kind == "image" and str(part.get("id")) in selected_ids:
             image_id = str(part["id"])
             try:
-                image_path = await part["component"].convert_to_file_path()
-                image_url = _path_to_data_url(
-                    Path(image_path),
+                image_url = await _component_to_data_url(
+                    part["component"],
                     compress_enabled=compress_enabled,
                     compress_max_size=compress_max_size,
                     compress_quality=compress_quality,
@@ -256,6 +255,35 @@ def _image_mime(data: bytes) -> str:
     return "image/jpeg"
 
 
+async def _component_to_data_url(
+    component: Any,
+    *,
+    compress_enabled: bool = False,
+    compress_max_size: int = 1280,
+    compress_quality: int = 85,
+) -> str:
+    convert_to_base64 = getattr(component, "convert_to_base64", None)
+    if callable(convert_to_base64):
+        encoded = str(await convert_to_base64() or "").strip()
+        if encoded:
+            original = base64.b64decode("".join(encoded.split()), validate=True)
+            return _bytes_to_data_url(
+                original,
+                compress_enabled=compress_enabled,
+                compress_max_size=compress_max_size,
+                compress_quality=compress_quality,
+                source_name="queued-image",
+            )
+
+    image_path = await component.convert_to_file_path()
+    return _path_to_data_url(
+        Path(image_path),
+        compress_enabled=compress_enabled,
+        compress_max_size=compress_max_size,
+        compress_quality=compress_quality,
+    )
+
+
 def _path_to_data_url(
     path: Path,
     *,
@@ -263,7 +291,23 @@ def _path_to_data_url(
     compress_max_size: int = 1280,
     compress_quality: int = 85,
 ) -> str:
-    original = path.read_bytes()
+    return _bytes_to_data_url(
+        path.read_bytes(),
+        compress_enabled=compress_enabled,
+        compress_max_size=compress_max_size,
+        compress_quality=compress_quality,
+        source_name=path.name,
+    )
+
+
+def _bytes_to_data_url(
+    original: bytes,
+    *,
+    compress_enabled: bool,
+    compress_max_size: int,
+    compress_quality: int,
+    source_name: str,
+) -> str:
     data = (
         prepare_image_bytes(
             original,
@@ -277,7 +321,7 @@ def _path_to_data_url(
     if compress_enabled and len(data) < len(original):
         logger.info(
             "[消息合并] 图片预处理完成: %s, %d KB -> %d KB",
-            path.name,
+            source_name,
             len(original) // 1024,
             len(data) // 1024,
         )

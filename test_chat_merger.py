@@ -515,6 +515,36 @@ class ChatMergerImageCaptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"图2": "有效图片"})
         self.assertEqual(provider.calls, 1)
 
+    async def test_queued_image_survives_source_event_cleanup(self) -> None:
+        plugin = ChatMergerVideoTests._plugin()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "event-owned.jpg"
+            image_path.write_bytes(b"jpeg")
+            image = Image(file=str(image_path), url=str(image_path))
+            event = _FakeEvent([image])
+
+            item = await plugin._build_queue_item(event, "", image_only=True)
+            image_path.unlink()
+            plugin._number_media_parts(item["parts"])
+            provider = _FakeVisionProvider("primary", '{"图1":"快照仍然可读"}')
+
+            result = await caption_ordered_images(
+                item["parts"],
+                providers=[provider],
+                prompt="转述图片",
+                refusal_keywords=[],
+                timeout_seconds=5,
+                max_images=9,
+            )
+
+        queued_image = next(
+            part["component"] for part in item["parts"] if part["kind"] == "image"
+        )
+        self.assertIsNot(queued_image, image)
+        self.assertTrue(str(queued_image.file).startswith("base64://"))
+        self.assertEqual(result, {"图1": "快照仍然可读"})
+        self.assertEqual(provider.calls, 1)
+
     async def test_disabled_caption_preserves_original_image(self) -> None:
         plugin = ChatMergerVideoTests._plugin()
         image = Image(file="D:/cache/image.jpg")

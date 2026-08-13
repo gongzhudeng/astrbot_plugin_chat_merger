@@ -5,6 +5,7 @@ import random
 import re
 import time
 from collections import defaultdict
+from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -56,7 +57,7 @@ MERGED_FLAG_KEY = "chat_merger_merged"
     "astrbot_plugin_chat_merger",
     "灵犀 · 消息合并助手",
     '彻底告别一问一答式AI聊天。自动合并连续消息、智能延迟后统一回复，AI思考时显示"对方正在输入…"。支持关键词触发超长等待、图片智能合并、等待时间随机波动、AI忙感知自动排队、LLM智能延迟判断、输入状态感知、撤回消息过滤，让AI对话真正拥有真人聊天的节奏感',
-    "2.8.0",
+    "2.8.1",
     "https://github.com/gongzhudeng/astrbot_plugin_chat_merger",
 )
 class ChatMergerPlugin(Star):
@@ -409,6 +410,31 @@ class ChatMergerPlugin(Star):
                 part["id"] = f"视频{video_index}"
 
     @staticmethod
+    async def _snapshot_image_component(component) -> Image:
+        """Detach an image from the source event's temporary-file lifecycle."""
+        convert_to_base64 = getattr(component, "convert_to_base64", None)
+        if callable(convert_to_base64):
+            encoded = str(await convert_to_base64() or "").strip()
+            if encoded:
+                return Image.fromBase64(encoded)
+
+        image_path = await component.convert_to_file_path()
+        image_bytes = await asyncio.to_thread(Path(image_path).read_bytes)
+        if not image_bytes:
+            raise ValueError("resolved image is empty")
+        return Image.fromBytes(image_bytes)
+
+    async def _snapshot_image_parts(self, parts: list[dict]) -> None:
+        for part in parts:
+            component = part.get("component")
+            if component is None or not self._is_image_component(component):
+                continue
+            try:
+                part["component"] = await self._snapshot_image_component(component)
+            except Exception as exc:
+                self._log(f"图片入队快照失败，后续将使用失败占位: {exc}")
+
+    @staticmethod
     def _emoji_library_service():
         try:
             module = importlib.import_module(
@@ -637,6 +663,7 @@ class ChatMergerPlugin(Star):
             image_only=image_only,
             video_only=video_only,
         )
+        await self._snapshot_image_parts(parts)
         preview_parts = []
         for part in parts:
             if part["kind"] == "text":
