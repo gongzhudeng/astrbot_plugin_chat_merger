@@ -57,7 +57,7 @@ MERGED_FLAG_KEY = "chat_merger_merged"
     "astrbot_plugin_chat_merger",
     "灵犀 · 消息合并助手",
     '彻底告别一问一答式AI聊天。自动合并连续消息、智能延迟后统一回复，AI思考时显示"对方正在输入…"。支持关键词触发超长等待、图片智能合并、等待时间随机波动、AI忙感知自动排队、LLM智能延迟判断、输入状态感知、撤回消息过滤，让AI对话真正拥有真人聊天的节奏感',
-    "2.8.1",
+    "2.8.2",
     "https://github.com/gongzhudeng/astrbot_plugin_chat_merger",
 )
 class ChatMergerPlugin(Star):
@@ -831,11 +831,18 @@ class ChatMergerPlugin(Star):
         skip_words = self._get_config("skip_words", [])
         mode = self._get_config("skip_words_mode", "包含")
         contains = self._is_contains_mode(mode)
+        require_message_end = bool(
+            self._get_config("skip_words_require_message_end", False)
+        )
         stripped = text.strip()
         for word in skip_words:
+            if not isinstance(word, str) or not word:
+                continue
             if not contains and stripped == word:
                 return True
-            if contains and word in text:
+            if contains and require_message_end and stripped.endswith(word):
+                return True
+            if contains and not require_message_end and word in text:
                 return True
         return False
 
@@ -1358,6 +1365,7 @@ class ChatMergerPlugin(Star):
             f"消息条数阈值: {self._get_config('max_message_count', 10)}条",
             f"跳过关键词: {self._get_config('skip_words', [])}",
             f"跳过词模式: {self._get_config('skip_words_mode', '包含')}",
+            f"跳过词须在消息末尾: {self._get_config('skip_words_require_message_end', False)}",
             f"等待关键词: {self._get_config('wait_keywords', ['等一下'])}",
             f"等待词模式: {self._get_config('wait_keyword_mode', '完全匹配')}",
             f"等待时间: {self._get_config('wait_keyword_seconds', 300)}秒 (0=无限)",

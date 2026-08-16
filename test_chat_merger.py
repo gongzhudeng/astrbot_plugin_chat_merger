@@ -83,6 +83,75 @@ class _FakeEvent:
         self._extras[key] = value
 
 
+class ChatMergerSkipWordTests(unittest.TestCase):
+    @staticmethod
+    def _plugin(config: dict) -> ChatMergerPlugin:
+        plugin = object.__new__(ChatMergerPlugin)
+        plugin.config = config
+        return plugin
+
+    def test_end_required_rejects_middle_match_and_accepts_trailing_whitespace(
+        self,
+    ) -> None:
+        plugin = self._plugin(
+            {
+                "skip_words": ["。"],
+                "skip_words_mode": "包含",
+                "skip_words_require_message_end": True,
+            }
+        )
+
+        self.assertFalse(plugin._check_skip_words("标题。后面还有分享链接！"))
+        self.assertTrue(plugin._check_skip_words("再发一遍给你。  \n"))
+        self.assertFalse(plugin._check_skip_words("结尾不是句号。！"))
+
+    def test_end_required_supports_multi_character_keywords(self) -> None:
+        plugin = self._plugin(
+            {
+                "skip_words": ["马上"],
+                "skip_words_mode": "包含",
+                "skip_words_require_message_end": True,
+            }
+        )
+
+        self.assertFalse(plugin._check_skip_words("马上处理这个问题"))
+        self.assertTrue(plugin._check_skip_words("这个问题要处理，马上"))
+
+    def test_disabled_end_requirement_preserves_contains_mode(self) -> None:
+        plugin = self._plugin(
+            {
+                "skip_words": ["。"],
+                "skip_words_mode": "包含",
+                "skip_words_require_message_end": False,
+            }
+        )
+
+        self.assertTrue(plugin._check_skip_words("标题。后面还有分享链接！"))
+
+    def test_exact_mode_is_unchanged_when_end_requirement_is_enabled(self) -> None:
+        plugin = self._plugin(
+            {
+                "skip_words": ["立刻"],
+                "skip_words_mode": "完全匹配",
+                "skip_words_require_message_end": True,
+            }
+        )
+
+        self.assertTrue(plugin._check_skip_words("  立刻  "))
+        self.assertFalse(plugin._check_skip_words("请立刻"))
+
+    def test_empty_skip_words_never_match(self) -> None:
+        plugin = self._plugin(
+            {
+                "skip_words": [""],
+                "skip_words_mode": "包含",
+                "skip_words_require_message_end": True,
+            }
+        )
+
+        self.assertFalse(plugin._check_skip_words("任意消息"))
+
+
 class ChatMergerVideoTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _plugin() -> ChatMergerPlugin:

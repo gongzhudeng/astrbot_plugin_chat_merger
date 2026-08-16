@@ -58,6 +58,12 @@
                 "default": "包含",
                 "options": ["包含", "完全匹配"]
             },
+            "skip_words_require_message_end": {
+                "description": "跳过关键词必须位于消息末尾",
+                "hint": "开启后，包含模式仅在消息去除末尾空白后以关键词结尾时触发；完全匹配模式不受影响",
+                "type": "bool",
+                "default": false
+            },
             "skip_words_random_delay_enabled": {
                 "description": "启用跳过词随机等待",
                 "hint": "命中跳过词后不立即发送，而是等待一个随机时间后再发送",
